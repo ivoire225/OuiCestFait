@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>OuiCestFait - Soumettre une demande</title>
+  <style>
+    body { font-family: Arial; padding: 20px; background-color: #f0f0f0; }
+    form { max-width: 600px; margin: auto; background: white; padding: 20px; border-radius: 8px; }
+    textarea { width: 100%; height: 100px; }
+    button { background: #4CAF50; color: white; padding: 10px; border: none; cursor: pointer; }
+    #result { margin-top: 20px; background: #e0e0e0; padding: 10px; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Soumettre une demande</h1>
+  <form id="missionForm">
+    <label for="texte">Ta demande :</label><br>
+    <textarea id="texte" placeholder="Ex. Urgent : livrer un colis à Paris ce soir" required></textarea><br><br>
+    <label for="token">Ton token (après login) : </label><br>
+    <input type="text" id="token" placeholder="Bearer eyJ..." required><br><br>
+    <button type="submit">Envoyer</button>
+  </form>
+  <div id="result"></div>
+
+  <script>
+    document.getElementById('missionForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const texte = document.getElementById('texte').value;
+      const token = document.getElementById('token').value;
+      try {
+        const response = await fetch('http://127.0.0.1:8000/mission/demande', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': token
+          },
+          body: JSON.stringify({ texte, client_id: 1 })
+        });
+        if (!response.ok) throw new Error(await response.text());
+        const data = await response.json();
+        document.getElementById('result').innerHTML = `<pre>${JSON.stringify(data, null, 2)}</pre>`;
+      } catch (error) {
+        document.getElementById('result').innerHTML = `<pre>Erreur : ${error.message}</pre>`;
+      }
+    });
+  </script>
+</body>
+</html>
