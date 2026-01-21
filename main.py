@@ -1,4 +1,4 @@
-﻿from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import Optional
@@ -12,307 +12,192 @@ from datetime import datetime, timedelta
 from telegram import Bot
 
 DB_NAME = "ouicestfait.db"
-BASE_MARGIN = 1.25
-COMMISSION = 0.15
-
-# Clé OpenAI (ta vraie clé)
-OPENAI_API_KEY = "sk-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"  # ← TA VRAIE CLÉ !
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# Telegram pour notifications
-TELEGRAM_TOKEN = "ton_token_bot_ici"  # ← Remplace par ton token BotFather
-TELEGRAM_CHAT_ID = "ton_chat_id_ici"  # ← Remplace par ton chat ID (ex. '123456789')
-
-bot = Bot(token=TELEGRAM_TOKEN)
-
-# Auth JWT
-SECRET_KEY = "ton_secret_super_long_change_le_par_quelque_chose_de_robuste"  # Change ça !
+BASE_PRICE = 50
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24h
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+app = FastAPI()
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-# Users MVP (mot de passe hashé avec bcrypt)
-users_db = {
-    "client": {
-        "username": "client",
-        "full_name": "Client MVP",
-        "hashed_password": bcrypt.hashpw(b"clientpass", bcrypt.gensalt()).decode('utf-8'),
-        "role": "client"
-    },
-    "operateur": {
-        "username": "operateur",
-        "full_name": "Opérateur MVP",
-        "hashed_password": bcrypt.hashpw(b"operateurpass", bcrypt.gensalt()).decode('utf-8'),
-        "role": "operateur"
-    }
-}
+class DemandeMission(BaseModel):
+    client_id: int
+    texte: str
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+class Mission(BaseModel):
+    client_id: int
+    resume_client: str
+    prix_recommande_eur: float
+    delai_estime: str
+    conditions: Optional[str] = None
+
+class User(BaseModel):
+    username: str
+
+class UserInDB(User):
+    hashed_password: str
+
+def create_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS missions
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  client_id INTEGER,
+                  resume_client TEXT,
+                  prix_recommande_eur REAL,
+                  delai_estime TEXT,
+                  conditions TEXT,
+                  status TEXT DEFAULT 'pending',
+                  date_creation DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (username TEXT PRIMARY KEY,
+                  hashed_password TEXT)''')
+    conn.commit()
+    conn.close()
+
+create_db()
+
+def get_db():
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def hash_password(password: str):
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+
+def verify_password(password: str, hashed_password: str):
+    return bcrypt.checkpw(password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
     to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
-# Dépendance pour vérifier le token
 async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
-        role: str = payload.get("role")
         if username is None:
-            raise HTTPException(status_code=401, detail="Token invalide")
-        return {"username": username, "role": role}
+            raise credentials_exception
     except JWTError:
-        raise HTTPException(status_code=401, detail="Token invalide")
+        raise credentials_exception
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    user = c.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    conn.close()
+    if user is None:
+        raise credentials_exception
+    return User(username=username)
 
-app = FastAPI(
-    title="OuiCestFait API",
-    version="0.1.3",
-    description="API MVP pour OuiCestFait - Gestion des missions de conciergerie"
-)
-
-def get_db():
-    return sqlite3.connect(DB_NAME, check_same_thread=False)
-
-def init_db():
-    db = get_db()
-    cur = db.cursor()
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        role TEXT CHECK(role IN ('client','operateur','admin')) NOT NULL,
-        name TEXT,
-        email TEXT,
-        phone TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS missions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        client_id INTEGER,
-        raw_request TEXT NOT NULL,
-        type_service TEXT,
-        depart TEXT,
-        arrivee TEXT,
-        delai_estime TEXT,
-        prix_recommande REAL,
-        conditions TEXT,
-        niveau_risque TEXT,
-        statut TEXT DEFAULT 'en_attente_validation',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS ia_decisions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        mission_id INTEGER,
-        ia_output_json TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS validations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        mission_id INTEGER,
-        operateur_id INTEGER,
-        action TEXT,
-        commentaire TEXT,
-        prix_final REAL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    """)
-    db.commit()
-    cur.execute("SELECT COUNT(*) FROM users")
-    if cur.fetchone()[0] == 0:
-        cur.execute("INSERT INTO users (role, name) VALUES ('client', 'Client MVP')")
-        cur.execute("INSERT INTO users (role, name) VALUES ('operateur', 'Opérateur MVP')")
-        db.commit()
-    db.close()
-
-@app.on_event("startup")
-def startup():
-    init_db()
-
-class MissionRequest(BaseModel):
-    texte: str
-    client_id: int = 1
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "texte": "Urgent : aller chercher un colis ce soir à Paris",
-                "client_id": 1
-            }
-        }
-
-class ValidationRequest(BaseModel):
-    mission_id: int
-    operateur_id: int = 2
-    action: str
-    prix_final: Optional[float] = None
-    commentaire: Optional[str] = None
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "mission_id": 1,
-                "operateur_id": 2,
-                "action": "validee",
-                "prix_final": 180.0,
-                "commentaire": "Prix ajusté pour l'urgence"
-            }
-        }
-
-def ia_analyse(texte: str) -> dict:
-    prompt = f"""
-Analyse ce texte de demande client pour une mission de conciergerie :
-"{texte}"
-
-Retourne UNIQUEMENT un JSON valide avec ces clés exactes :
-{{
-  "resume_client": "résumé court de la demande",
-  "type_service": "conciergerie" ou "convoyage" ou "livraison" ou "courses" ou "autre",
-  "solution": "phrase courte expliquant la solution",
-  "depart": "ville ou 'À préciser'",
-  "arrivee": "ville ou 'À préciser'",
-  "delai_estime": "estimation en texte (ex. 'sous 2h', '24h')",
-  "prix_recommande_eur": nombre entier,
-  "conditions": ["condition1", "condition2"],
-  "niveau_risque": "faible" ou "moyen" ou "élevé",
-  "commentaire_operateur": "texte pour l'opérateur"
-}}
-"""
-
+@app.post("/users/")
+def create_user(form_data: OAuth2PasswordRequestForm = Depends()):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    hashed_password = hash_password(form_data.password)
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=500
-        )
-        raw_content = response.choices[0].message.content.strip()
-        if raw_content.startswith("```json"):
-            raw_content = raw_content[7:-3].strip()
-        ia_output = json.loads(raw_content)
-    except Exception as e:
-        print(f"Erreur OpenAI : {e}")
-        # Fallback
-        t = texte.lower()
-        type_service = "conciergerie"
-        if "voiture" in t or "garage" in t:
-            type_service = "convoyage"
-        elif "colis" in t or "livraison" in t or "document" in t:
-            type_service = "livraison"
-        elif "courses" in t or "pharmacie" in t:
-            type_service = "courses"
+        c.execute("INSERT INTO users (username, hashed_password) VALUES (?, ?)", (form_data.username, hashed_password))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    conn.close()
+    return {"message": "User created"}
 
-        distance_km = 100
-        delai = "24 à 48h"
-        risque = "faible"
-        if "urgent" in t or "ce soir" in t:
-            delai, risque = "sous 2 à 6h (premium)", "moyen"
-
-        cout_estime = 0.8 * distance_km
-        prix_interne = cout_estime * BASE_MARGIN
-        prix_final = prix_interne * (1 + COMMISSION)
-
-        ia_output = {
-            "resume_client": texte,
-            "type_service": type_service,
-            "solution": "Toujours une solution : immédiate, différée ou premium",
-            "depart": "À préciser",
-            "arrivee": "À préciser",
-            "delai_estime": delai,
-            "prix_recommande_eur": round(prix_final, 2),
-            "conditions": ["paiement à l’avance", "preuve de réalisation"],
-            "niveau_risque": risque,
-            "commentaire_operateur": "Validation humaine requise (MVP)"
-        }
-    return ia_output
-
-@app.get("/health", summary="Vérifie l'état de l'API et de la base de données")
-def health():
-    return {"status": "ok", "db": DB_NAME}
-
-@app.post("/token", summary="Login client ou opérateur")
+@app.post("/token")
 def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = users_db.get(form_data.username)
-    if not user or not verify_password(form_data.password, user["hashed_password"]):
-        raise HTTPException(status_code=401, detail="Identifiants incorrects")
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    user = c.execute("SELECT * FROM users WHERE username = ?", (form_data.username,)).fetchone()
+    conn.close()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    if not verify_password(form_data.password, user[1]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": form_data.username, "role": user["role"]},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        data={"sub": form_data.username}, expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-@app.post("/mission/demande", summary="Créer une nouvelle mission (client authentifié)")
-def creer_mission(data: MissionRequest, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] not in ["client", "admin"]:
-        raise HTTPException(status_code=403, detail="Accès réservé aux clients")
-    ia_output = ia_analyse(data.texte)
-    db = get_db()
-    cur = db.cursor()
-    cur.execute(
-        """INSERT INTO missions (client_id, raw_request, type_service, depart, arrivee, delai_estime,
-                                 prix_recommande, conditions, niveau_risque, statut)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            data.client_id,
-            data.texte,
-            ia_output["type_service"],
-            ia_output["depart"],
-            ia_output["arrivee"],
-            ia_output["delai_estime"],
-            ia_output["prix_recommande_eur"],
-            json.dumps(ia_output["conditions"], ensure_ascii=False),
-            ia_output["niveau_risque"],
-            "en_attente_validation",
-        ),
-    )
-    mission_id = cur.lastrowid
-    cur.execute(
-        "INSERT INTO ia_decisions (mission_id, ia_output_json) VALUES (?, ?)",
-        (mission_id, json.dumps(ia_output, ensure_ascii=False)),
-    )
-    db.commit()
-    db.close()
+@app.post("/mission/demande", response_model=Mission)
+def demander_mission(demande: DemandeMission):
+    # Commenté temporairement pour tester sans auth
+    # user = await get_current_user()
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    prompt = f"Analyse cette demande de mission : '{demande.texte}'. Fournis :
+    - resume_client : résumé clair de la demande du client.
+    - prix_recommande_eur : prix recommandé en euros, base 50 + calcul en fonction de distance, urgence, complexité.
+    - delai_estime : délai estimé (ex. 'sous 1h', 'demain matin').
+    - conditions : conditions ou notes supplémentaires (ex. 'paiement à l’avance si urgent').
+    Réponds en JSON strict sans autre texte."
+    try:
+        response = client.completions.create(
+            model="gpt-3.5-turbo-instruct",
+            prompt=prompt,
+            max_tokens=200,
+            temperature=0.7
+        )
+        ai_response = response.choices[0].text.strip()
+        ai_data = json.loads(ai_response)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''INSERT INTO missions (client_id, resume_client, prix_recommande_eur, delai_estime, conditions) VALUES (?, ?, ?, ?, ?)''',
+              (demande.client_id, ai_data['resume_client'], ai_data['prix_recommande_eur'], ai_data['delai_estime'], ai_data.get('conditions', None)))
+    mission_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    bot = Bot(token=TELEGRAM_TOKEN)
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"Nouvelle mission {mission_id} : {ai_data['resume_client']} - Prix : {ai_data['prix_recommande_eur']} € - Délai : {ai_data['delai_estime']}")
+
+    return Mission(client_id=demande.client_id, **ai_data)
+
+@app.get("/missions/{mission_id}")
+def get_mission(mission_id: int, current_user: User = Depends(get_current_user)):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    mission = c.execute("SELECT * FROM missions WHERE id = ?", (mission_id,)).fetchone()
+    conn.close()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
     return {
-        "mission_id": mission_id,
-        "proposition_ia": ia_output,
-        "message_client": f"✅ Mission possible\n💰 Prix estimé : {ia_output['prix_recommande_eur']} €\n⏱ Délai : {ia_output['delai_estime']}\n🔒 Paiement requis pour lancement"
+        "id": mission[0],
+        "client_id": mission[1],
+        "resume_client": mission[2],
+        "prix_recommande_eur": mission[3],
+        "delai_estime": mission[4],
+        "conditions": mission[5],
+        "status": mission[6],
+        "date_creation": mission[7]
     }
 
-@app.post("/mission/validation", summary="Valider ou ajuster une mission (opérateur uniquement)")
-def valider_mission(data: ValidationRequest, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != "operateur":
-        raise HTTPException(status_code=403, detail="Accès réservé aux opérateurs")
-    db = get_db()
-    cur = db.cursor()
-    cur.execute("SELECT prix_recommande FROM missions WHERE id=?", (data.mission_id,))
-    row = cur.fetchone()
-    if not row:
-        db.close()
-        raise HTTPException(status_code=404, detail="Mission introuvable")
-    prix_actuel = row[0]
-    prix_final = data.prix_final if data.prix_final is not None else prix_actuel
-    cur.execute(
-        "UPDATE missions SET statut='validee', prix_recommande=? WHERE id=?",
-        (prix_final, data.mission_id),
-    )
-    cur.execute(
-        "INSERT INTO validations (mission_id, operateur_id, action, commentaire, prix_final) VALUES (?, ?, ?, ?, ?)",
-        (data.mission_id, data.operateur_id, data.action, data.commentaire, prix_final),
-    )
-    db.commit()
-    db.close()
-    # Notification Telegram
-    message = f"✅ Mission {data.mission_id} validée !\nPrix final : {prix_final} €\nCommentaire : {data.commentaire or 'Aucun'}\nPar opérateur : {current_user['username']}"
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-    return {
-        "status": "ok",
-        "mission_id": data.mission_id,
-        "prix_final": prix_final,
-        "message_client": "✅ Mission validée. Procédez au paiement pour lancement."
-    }
+@app.patch("/missions/{mission_id}")
+def update_mission(mission_id: int, status: Optional[str] = None, current_user: User = Depends(get_current_user)):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    if status:
+        c.execute("UPDATE missions SET status = ? WHERE id = ?", (status, mission_id))
+    conn.commit()
+    conn.close()
+    return {"message": "Mission updated"}
 
 # Personnalisation OpenAPI
 def custom_openapi():
