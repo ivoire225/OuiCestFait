@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+﻿from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import Optional
@@ -10,6 +10,7 @@ from jose import JWTError, jwt
 import bcrypt
 from datetime import datetime, timedelta
 from telegram import Bot
+import os  # Ajouté pour os.getenv
 
 DB_NAME = "ouicestfait.db"
 BASE_PRICE = 50
@@ -33,7 +34,7 @@ class Mission(BaseModel):
     resume_client: str
     prix_recommande_eur: float
     delai_estime: str
-    conditions: Optional[str] = None
+    conditions: Optional[str] = None  # Correction : Optional[str] = None au lieu de = None = "paiement à l'avance si urgent"
 
 class User(BaseModel):
     username: str
@@ -107,9 +108,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 
 @app.post("/users/")
 def create_user(form_data: OAuth2PasswordRequestForm = Depends()):
+    hashed_password = hash_password(form_data.password)
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    hashed_password = hash_password(form_data.password)
     try:
         c.execute("INSERT INTO users (username, hashed_password) VALUES (?, ?)", (form_data.username, hashed_password))
         conn.commit()
@@ -138,13 +139,9 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
 def demander_mission(demande: DemandeMission):
     # Commenté temporairement pour tester sans auth
     # user = await get_current_user()
+
     client = OpenAI(api_key=OPENAI_API_KEY)
-    prompt = f"Analyse cette demande de mission : '{demande.texte}'. Fournis :
-    - resume_client : résumé clair de la demande du client.
-    - prix_recommande_eur : prix recommandé en euros, base 50 + calcul en fonction de distance, urgence, complexité.
-    - delai_estime : délai estimé (ex. 'sous 1h', 'demain matin').
-    - conditions : conditions ou notes supplémentaires (ex. 'paiement à l’avance si urgent').
-    Réponds en JSON strict sans autre texte."
+    prompt = f"Analyse cette demande de mission : '{demande.texte}'. Fournis :\n- resume_client : résumé clair de la demande du client.\n- prix_recommande_eur : prix recommandé en euros, base 50 + calcul en fonction de distance, urgence, complexité.\n- delai_estime : délai estimé (ex. 'sous 1h', 'demain matin').\n- conditions : conditions ou notes supplémentaires (ex. 'paiement à l'avance si urgent').\nRéponds en JSON strict sans autre texte."
     try:
         response = client.completions.create(
             model="gpt-3.5-turbo-instruct",
