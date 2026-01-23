@@ -1,4 +1,4 @@
-﻿from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import Optional
@@ -34,7 +34,7 @@ class Mission(BaseModel):
     resume_client: str
     prix_recommande_eur: float
     delai_estime: str
-    conditions: Optional[str] = None  # Correction : Optional[str] = None au lieu de = None = "paiement à l'avance si urgent"
+    conditions: Optional[str] = None
 
 class User(BaseModel):
     username: str
@@ -61,13 +61,6 @@ def create_db():
     conn.close()
 
 create_db()
-
-def get_db():
-    conn = sqlite3.connect(DB_NAME)
-    try:
-        yield conn
-    finally:
-        conn.close()
 
 def hash_password(password: str):
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
@@ -136,9 +129,8 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/mission/demande", response_model=Mission)
-def demander_mission(demande: DemandeMission):
-    # Commenté temporairement pour tester sans auth
-    # user = await get_current_user()
+async def demander_mission(demande: DemandeMission):
+    # user = await get_current_user()  # Commenté pour test
 
     client = OpenAI(api_key=OPENAI_API_KEY)
     prompt = f"Analyse cette demande de mission : '{demande.texte}'. Fournis :\n- resume_client : résumé clair de la demande du client.\n- prix_recommande_eur : prix recommandé en euros, base 50 + calcul en fonction de distance, urgence, complexité.\n- delai_estime : délai estimé (ex. 'sous 1h', 'demain matin').\n- conditions : conditions ou notes supplémentaires (ex. 'paiement à l'avance si urgent').\nRéponds en JSON strict sans autre texte."
@@ -163,7 +155,7 @@ def demander_mission(demande: DemandeMission):
     conn.close()
 
     bot = Bot(token=TELEGRAM_TOKEN)
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"Nouvelle mission {mission_id} : {ai_data['resume_client']} - Prix : {ai_data['prix_recommande_eur']} € - Délai : {ai_data['delai_estime']}")
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"Nouvelle mission {mission_id} : {ai_data['resume_client']} - Prix : {ai_data['prix_recommande_eur']} € - Délai : {ai_data['delai_estime']}")
 
     return Mission(client_id=demande.client_id, **ai_data)
 
