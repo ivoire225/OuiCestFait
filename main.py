@@ -10,7 +10,7 @@ from jose import JWTError, jwt
 import bcrypt
 from datetime import datetime, timedelta
 from telegram import Bot
-import os  # Ajouté pour os.getenv
+import os  # For os.getenv
 
 DB_NAME = "ouicestfait.db"
 BASE_PRICE = 50
@@ -133,7 +133,15 @@ async def demander_mission(demande: DemandeMission):
     # user = await get_current_user()  # Commenté pour test
 
     client = OpenAI(api_key=OPENAI_API_KEY)
-    prompt = f"Analyse cette demande de mission : '{demande.texte}'. Fournis :\n- resume_client : résumé clair de la demande du client.\n- prix_recommande_eur : prix recommandé en euros, base 50 + calcul en fonction de distance, urgence, complexité.\n- delai_estime : délai estimé (ex. 'sous 1h', 'demain matin').\n- conditions : conditions ou notes supplémentaires (ex. 'paiement à l'avance si urgent').\nRéponds en JSON strict sans autre texte."
+    prompt = f"""Réponds UNIQUEMENT avec un JSON valide, sans aucun texte avant ou après, sans explication, sans markdown, sans guillemets supplémentaires. Structure exacte :
+    {{
+      "resume_client": "résumé court et clair de la demande",
+      "prix_recommande_eur": nombre entier ou décimal (ex. 80.0),
+      "delai_estime": "délai court (ex. sous 1h, demain matin)",
+      "conditions": "notes courtes ou vide"
+    }}
+    Analyse cette demande : '{demande.texte}'"""
+
     try:
         response = client.completions.create(
             model="gpt-3.5-turbo-instruct",
@@ -142,7 +150,15 @@ async def demander_mission(demande: DemandeMission):
             temperature=0.7
         )
         ai_response = response.choices[0].text.strip()
-        ai_data = json.loads(ai_response)
+        try:
+            ai_data = json.loads(ai_response)
+        except json.JSONDecodeError:
+            ai_data = {
+                "resume_client": demande.texte,
+                "prix_recommande_eur": 80.0,
+                "delai_estime": "sous 2h",
+                "conditions": "Erreur d'analyse IA, prix par défaut"
+            }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
