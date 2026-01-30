@@ -6,13 +6,13 @@
 # - Prix final arrondi (2 décimales) de façon sûre
 #
 # IMPORTANT (Make):
-# 1) Dans le module HTTP (POST /mission/demande), envoie un JSON string:
+# 1) Dans le module HTTP (POST /mission/demande), envoie un JSON string (application/json):
 #    {
 #      "message_id": "{{1.Messages[1].id}}",
-#      "client_id": "{{1.Contacts[1].WhatsApp ID}}",
+#      "client_id": "{{1.Messages[1].from}}",
 #      "texte": "{{1.Messages[1].Text.Body}}"
 #    }
-# 2) N’envoie pas WhatsApp Business Account ID comme client_id.
+# 2) N’envoie pas WhatsApp Business Account ID comme client_id (c’est ton compte WABA, pas le client).
 # 3) Active le scenario (ON). "Run once" sert uniquement pour tester.
 #
 # Lancement local:
@@ -28,7 +28,6 @@ import re
 import json
 import time
 import sqlite3
-import hashlib
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Dict, Any, List, Tuple
@@ -47,12 +46,11 @@ DB_PATH = os.getenv("DB_PATH", "ouicestfait.db")
 # Fenêtre pour regrouper plusieurs messages d’un même client (secondes)
 CLIENT_BUFFER_WINDOW_SEC = int(os.getenv("CLIENT_BUFFER_WINDOW_SEC", "25"))
 
-# Optionnel: si tu veux éviter de répondre à ton propre numéro / WABA (anti-boucle complémentaire)
+# Optionnel: éviter de répondre à ton propre numéro (anti-boucle complémentaire)
 # Exemple: "33759055781" (sans espaces)
 WHATSAPP_OWN_NUMBER = os.getenv("WHATSAPP_OWN_NUMBER", "").strip()
 
-# Limites / pricing
-WORST_CASE_DEPARTURE_BUFFER_KM = int(os.getenv("WORST_CASE_DEPARTURE_BUFFER_KM", "70"))
+# Pricing (base)
 MIN_PRICE_EUR = Decimal(os.getenv("MIN_PRICE_EUR", "25"))
 URGENT_BASE_EUR = Decimal(os.getenv("URGENT_BASE_EUR", "150"))
 LONG_DISTANCE_BASE_EUR = Decimal(os.getenv("LONG_DISTANCE_BASE_EUR", "300"))
@@ -65,7 +63,7 @@ DEBUG = os.getenv("DEBUG", "0") == "1"
 # App
 # =========================
 
-app = FastAPI(title=f"{APP_NAME} API", version="1.0.0")
+app = FastAPI(title=f"{APP_NAME} API", version="1.1.0")
 
 
 # =========================
@@ -75,10 +73,14 @@ app = FastAPI(title=f"{APP_NAME} API", version="1.0.0")
 class DemandeMission(BaseModel):
     """
     Requête reçue depuis Make/WhatsApp.
+    On tolère des variations (ex: `from`, `text`) pour éviter les pannes Make.
     """
-    message_id: Optional[str] = Field(None, description="Identifiant unique du message WhatsApp (pour anti-doublon).")
-    client_id: str = Field(..., description="Identifiant client (WhatsApp ID / téléphone).")
-    texte: str = Field(..., description="Demande client en texte libre.")
+    message_id: Optional[str] = Field(None, description="Identifiant unique du message WhatsApp (anti-doublon).")
+    client_id: Optional[str] = Field(None, description="Identifiant client (WhatsApp ID / téléphone).")
+    texte: Optional[str] = Field(None, description="Demande client en texte libre.")
+
+    class Config:
+        extra = "allow"  # important: accepte les champs inattendus (from, text, etc.)
 
 
 class MissionOut(BaseModel):
@@ -117,7 +119,6 @@ def init_db() -> None:
     conn = _db()
     cur = conn.cursor()
 
-    # Table missions
     cur.execute("""
     CREATE TABLE IF NOT EXISTS missions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,7 +137,6 @@ def init_db() -> None:
     )
     """)
 
-    # Table message_dedup (anti-boucle / anti-doublons)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS message_dedup (
         message_id TEXT PRIMARY KEY,
@@ -145,7 +145,6 @@ def init_db() -> None:
     )
     """)
 
-    # Buffer multi-messages par client (regroupement)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS client_message_buffer (
         client_id TEXT PRIMARY KEY,
@@ -155,7 +154,6 @@ def init_db() -> None:
     )
     """)
 
-    # Audit / logs (optionnel)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS audit_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,20 +179,13 @@ def utc_now_iso() -> str:
 
 
 def normalize_client_id(client_id: str) -> str:
-    # Supprime espaces, +, etc pour normaliser (WhatsApp ID est souvent déjà numérique)
     x = (client_id or "").strip()
     x = x.replace(" ", "").replace("+", "")
     return x
 
 
 def safe_round_eur(value: Decimal) -> Decimal:
-    # Arrondi monétaire fiable à 2 décimales (0.01)
-    q = Decimal("0.01")
-    return value.quantize(q, rounding=ROUND_HALF_UP)
-
-
-def as_float_or_none(x: Optional[Decimal]) -> Optional[float]:
-    return float(x) if x is not None else None
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def _log(kind: str, payload: Dict[str, Any]) -> None:
@@ -212,13 +203,52 @@ def _log(kind: str, payload: Dict[str, Any]) -> None:
         pass
 
 
+def _get_any(d: Dict[str, Any], *keys: str) -> Optional[Any]:
+    for k in keys:
+        if k in d and d[k] not in (None, "", []):
+            return d[k]
+    return None
+
+
+def resolve_payload(payload: DemandeMission) -> Tuple[str, Optional[str], str]:
+    """
+    Rend l'API tolérante si Make envoie des clés différentes.
+    On cherche:
+      - client_id via client_id OU from OU wa_id...
+      - message_id via message_id OU id...
+      - texte via texte OU text.body...
+    """
+    raw = payload.dict()
+
+    # message_id
+    msg_id = payload.message_id or _get_any(raw, "id", "messageId", "messageID")
+    if isinstance(msg_id, (int, float)):
+        msg_id = str(msg_id)
+    msg_id = (str(msg_id).strip() if msg_id else None) or None
+
+    # client_id
+    cid = payload.client_id or _get_any(raw, "from", "wa_id", "whatsapp_id", "whatsappId", "sender")
+    if isinstance(cid, (int, float)):
+        cid = str(cid)
+    cid = normalize_client_id(str(cid)) if cid else ""
+
+    # texte
+    txt = payload.texte or _get_any(raw, "text", "body", "message", "content")
+    # cas où Make envoie {"text": {"body": "..."}}
+    if isinstance(txt, dict):
+        txt = _get_any(txt, "body", "Body", "text", "Text")
+    txt = (str(txt).strip() if txt else "")
+
+    return cid, msg_id, txt
+
+
+# =========================
+# Détection + pricing
+# =========================
+
 def detect_intent(text: str) -> Dict[str, Any]:
-    """
-    Détection simple (sans IA) : tu peux remplacer par ton moteur IA plus tard.
-    """
     t = (text or "").lower()
 
-    # types
     if any(k in t for k in ["livraison", "colis", "document", "dossier", "remettre", "déposer"]):
         type_detecte = "livraison"
     elif any(k in t for k in ["courses", "supermarché", "acheter", "liste de courses"]):
@@ -228,14 +258,10 @@ def detect_intent(text: str) -> Dict[str, Any]:
     else:
         type_detecte = "conciergerie"
 
-    # urgence
     urgent = any(k in t for k in ["urgent", "urgence", "rapidement", "tout de suite", "sous 1h", "immédiat"])
     delai_estime = "sous 1h" if urgent else "dans la journée"
 
-    # zone (très simplifiée)
-    zone_tarifaire = None
-    if any(k in t for k in ["paris", "75"]):
-        zone_tarifaire = "IDF/Paris"
+    zone_tarifaire = "IDF/Paris" if any(k in t for k in ["paris", "75"]) else None
 
     return {
         "type_detecte": type_detecte,
@@ -246,17 +272,11 @@ def detect_intent(text: str) -> Dict[str, Any]:
 
 
 def _extract_city_pair(text: str) -> Optional[Tuple[str, str]]:
-    """
-    Extrait des patterns style 'Paris -> Torcy' / 'Paris à Lyon' (approx).
-    Retourne (from, to) si trouvé.
-    """
     if not text:
         return None
-    # Paris -> Torcy
     m = re.search(r"([A-Za-zÀ-ÿ'\- ]+)\s*(?:->|→)\s*([A-Za-zÀ-ÿ'\- ]+)", text)
     if m:
         return (m.group(1).strip(), m.group(2).strip())
-    # de Paris à Lyon
     m = re.search(r"(?:de|depuis)\s+([A-Za-zÀ-ÿ'\- ]+)\s+(?:à|vers)\s+([A-Za-zÀ-ÿ'\- ]+)", text, re.IGNORECASE)
     if m:
         return (m.group(1).strip(), m.group(2).strip())
@@ -264,41 +284,31 @@ def _extract_city_pair(text: str) -> Optional[Tuple[str, str]]:
 
 
 def _simple_pricing(text: str, intent: Dict[str, Any]) -> Tuple[Decimal, str, str]:
-    """
-    Pricing très simple et cohérent pour démarrer (à améliorer ensuite).
-    Retour:
-      prix (Decimal), resume_client, conditions
-    """
     t = text or ""
     urgent = intent["urgent"]
     type_detecte = intent["type_detecte"]
 
-    # résumé court
     resume = t.strip()
     if len(resume) > 120:
         resume = resume[:117] + "..."
 
-    # base
     price = URGENT_BASE_EUR if urgent else Decimal("80")
 
-    # distance heuristique via villes
     pair = _extract_city_pair(t)
     if pair:
-        frm, to = pair
-        # heuristique "longue distance" si destination hors IDF courante
-        if any(k in to.lower() for k in ["lyon", "marseille", "lille", "bordeaux", "nantes", "toulouse", "strasbourg", "orleans"]):
+        _, to = pair
+        if any(k in to.lower() for k in [
+            "lyon", "marseille", "lille", "bordeaux", "nantes", "toulouse", "strasbourg", "orleans"
+        ]):
             price = max(price, LONG_DISTANCE_BASE_EUR)
 
-    # bonus selon type
     if type_detecte == "courses":
         price += Decimal("30")
     elif type_detecte == "transport":
         price += Decimal("80")
 
-    # plancher
     price = max(price, MIN_PRICE_EUR)
 
-    # conditions
     conditions = (
         "Paiement 100% à l'avance.\n"
         "Preuve de prise en charge et de livraison (photo / signature / message).\n"
@@ -314,12 +324,8 @@ def _simple_pricing(text: str, intent: Dict[str, Any]) -> Tuple[Decimal, str, st
 # =========================
 
 def dedup_check_and_store(message_id: Optional[str], client_id: str) -> bool:
-    """
-    Retourne True si c'est un doublon (déjà vu), False sinon.
-    Stocke le message_id si nouveau.
-    """
     if not message_id:
-        return False  # pas d'id -> on ne peut pas dédupliquer côté serveur
+        return False
 
     conn = _db()
     cur = conn.cursor()
@@ -340,9 +346,6 @@ def dedup_check_and_store(message_id: Optional[str], client_id: str) -> bool:
 
 
 def anti_loop_ignore(client_id: str) -> bool:
-    """
-    Bloque les réponses si le client_id correspond à ton propre numéro (optionnel).
-    """
     if not WHATSAPP_OWN_NUMBER:
         return False
     return normalize_client_id(client_id) == normalize_client_id(WHATSAPP_OWN_NUMBER)
@@ -353,15 +356,14 @@ def anti_loop_ignore(client_id: str) -> bool:
 # =========================
 
 def buffer_append_and_maybe_flush(client_id: str, new_text: str) -> Tuple[bool, str]:
-    """
-    Ajoute le message au buffer du client. Si fenêtre expirée => flush.
-    Retour:
-      (should_process_now, merged_text)
-    """
     now = int(time.time())
     new_text = (new_text or "").strip()
     if not new_text:
         return (False, "")
+
+    # Si la fenêtre = 0 => traitement immédiat
+    if CLIENT_BUFFER_WINDOW_SEC <= 0:
+        return (True, new_text)
 
     conn = _db()
     cur = conn.cursor()
@@ -379,14 +381,11 @@ def buffer_append_and_maybe_flush(client_id: str, new_text: str) -> Tuple[bool, 
         return (False, new_text)
 
     buffer_text = row["buffer_text"]
-    first_at = int(row["first_at"])
     last_at = int(row["last_at"])
 
-    # Si dernier message est trop ancien => flush le précédent, puis démarre nouveau buffer
     if now - last_at > CLIENT_BUFFER_WINDOW_SEC:
-        # flush précédent
-        merged_prev = buffer_text.strip()
-        # reset buffer avec nouveau message
+        merged_prev = (buffer_text or "").strip()
+
         cur.execute(
             "UPDATE client_message_buffer SET buffer_text=?, first_at=?, last_at=? WHERE client_id=?",
             (new_text, now, now, client_id),
@@ -395,7 +394,6 @@ def buffer_append_and_maybe_flush(client_id: str, new_text: str) -> Tuple[bool, 
         conn.close()
         return (True, merged_prev)
 
-    # Sinon, concatène et continue
     merged = (buffer_text + "\n" + new_text).strip()
     cur.execute(
         "UPDATE client_message_buffer SET buffer_text=?, last_at=? WHERE client_id=?",
@@ -404,24 +402,6 @@ def buffer_append_and_maybe_flush(client_id: str, new_text: str) -> Tuple[bool, 
     conn.commit()
     conn.close()
     return (False, merged)
-
-
-def buffer_force_flush(client_id: str) -> Optional[str]:
-    """
-    Force le flush du buffer (utile si tu veux déclencher via un cron/worker plus tard).
-    """
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("SELECT buffer_text FROM client_message_buffer WHERE client_id = ?", (client_id,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return None
-    merged = (row["buffer_text"] or "").strip()
-    cur.execute("DELETE FROM client_message_buffer WHERE client_id = ?", (client_id,))
-    conn.commit()
-    conn.close()
-    return merged if merged else None
 
 
 # =========================
@@ -482,6 +462,7 @@ def get_client_history(client_id: str, limit: int = 10) -> List[MissionHistoryIt
     """, (client_id, limit))
     rows = cur.fetchall()
     conn.close()
+
     out: List[MissionHistoryItem] = []
     for r in rows:
         out.append(MissionHistoryItem(
@@ -507,37 +488,28 @@ def health() -> Dict[str, Any]:
 
 @app.post("/mission/demande", response_model=MissionOut)
 def mission_demande(payload: DemandeMission) -> MissionOut:
-    """
-    Endpoint appelé par Make (HTTP module).
-    Gère:
-      - anti-boucle / dedupe
-      - buffer multi-messages
-      - création mission + pricing + arrondi
-    """
-    client_id = normalize_client_id(payload.client_id)
-    texte = (payload.texte or "").strip()
-    message_id = (payload.message_id or "").strip() or None
+    client_id, message_id, texte = resolve_payload(payload)
 
     if not client_id:
-        raise HTTPException(status_code=422, detail="client_id manquant")
+        _log("bad_payload_no_client_id", {"payload": payload.dict()})
+        raise HTTPException(
+            status_code=422,
+            detail="client_id manquant (Make: mappe Messages[1].from ou Contacts[1].WhatsApp ID)"
+        )
 
     if anti_loop_ignore(client_id):
         _log("ignore_self", {"client_id": client_id})
         raise HTTPException(status_code=200, detail="ignored_self")
 
-    # anti-boucle / dedupe
     if dedup_check_and_store(message_id, client_id):
         _log("dedup_hit", {"client_id": client_id, "message_id": message_id})
         raise HTTPException(status_code=200, detail="duplicate_message")
 
-    # buffer multi-messages
     should_process_now, merged = buffer_append_and_maybe_flush(client_id, texte)
 
-    # Si on vient juste d'ajouter au buffer, on ne répond pas tout de suite (pour regrouper)
-    # NOTE: Pour un mode 100% instantané, mets CLIENT_BUFFER_WINDOW_SEC=0 et/ou renvoie une ack.
+    # Important: si tu branches HTTP -> Send a message direct, ajoute un filtre dans Make:
+    # n'envoie vers WhatsApp que si statut != "buffering"
     if not should_process_now:
-        # On renvoie une réponse "ack" (mais Make/WhatsApp va quand même envoyer si tu le branches direct).
-        # Astuce Make: place un filtre pour n'envoyer vers WhatsApp que si "statut" != "buffering".
         return MissionOut(
             mission_id=0,
             client_id=client_id,
@@ -556,7 +528,7 @@ def mission_demande(payload: DemandeMission) -> MissionOut:
     intent = detect_intent(merged_request)
     prix, resume, conditions = _simple_pricing(merged_request, intent)
 
-    # Arrondi forcé du prix (important pour éviter 325.78000000000003)
+    # Arrondi monétaire forcé (évite 325.78000000000003)
     prix = safe_round_eur(prix)
 
     mission_id = create_mission(
