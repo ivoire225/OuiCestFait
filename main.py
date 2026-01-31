@@ -3,23 +3,21 @@
 # - Déduplication anti-boucle (message_id unique)
 # - Regroupement de plusieurs messages d’un même client (buffer + fenêtre)
 # - Historique / suivi mission en SQLite
-# - Prix final arrondi (2 décimales) de façon sûre
+# - Tolérance MAX sur le payload Make (plat OU imbriqué Messages[] / webhook Meta)
 #
-# IMPORTANT (Make):
-# 1) Dans le module HTTP (POST /mission/demande), envoie un JSON string (application/json):
-#    {
-#      "message_id": "{{1.Messages[1].id}}",
-#      "client_id": "{{1.Messages[1].from}}",
-#      "texte": "{{1.Messages[1].Text.Body}}"
-#    }
-# 2) N’envoie pas WhatsApp Business Account ID comme client_id (c’est ton compte WABA, pas le client).
-# 3) Active le scenario (ON). "Run once" sert uniquement pour tester.
+# IMPORTANT (Make) - recommandé:
+# Dans le module HTTP (POST /mission/demande), envoie un JSON (application/json).
+# Idéalement via "Body type: Raw" + "Content type: application/json" OU "JSON" mappé.
 #
-# Lancement local:
-#   uvicorn main:app --host 0.0.0.0 --port 8000
+# Exemple JSON "plat" idéal:
+# {
+#   "message_id": "{{1.Messages[1].id}}",
+#   "client_id": "{{1.Messages[1].from}}",
+#   "texte": "{{1.Messages[1].Text.Body}}"
+# }
 #
-# Déploiement Railway:
-#   commande: uvicorn main:app --host 0.0.0.0 --port $PORT
+# Si Make n'arrive pas à mapper `from`, l'API ci-dessous va aussi tenter de le retrouver
+# dans des structures imbriquées (Messages[0].from, entry[0].changes[0].value.messages[0].from, etc.)
 
 from __future__ import annotations
 
@@ -30,7 +28,7 @@ import time
 import sqlite3
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Union
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -55,7 +53,7 @@ MIN_PRICE_EUR = Decimal(os.getenv("MIN_PRICE_EUR", "25"))
 URGENT_BASE_EUR = Decimal(os.getenv("URGENT_BASE_EUR", "150"))
 LONG_DISTANCE_BASE_EUR = Decimal(os.getenv("LONG_DISTANCE_BASE_EUR", "300"))
 
-# Debug
+# Debug (log en DB)
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
 
@@ -63,7 +61,7 @@ DEBUG = os.getenv("DEBUG", "0") == "1"
 # App
 # =========================
 
-app = FastAPI(title=f"{APP_NAME} API", version="1.1.0")
+app = FastAPI(title=f"{APP_NAME} API", version="1.2.0")
 
 
 # =========================
@@ -73,14 +71,14 @@ app = FastAPI(title=f"{APP_NAME} API", version="1.1.0")
 class DemandeMission(BaseModel):
     """
     Requête reçue depuis Make/WhatsApp.
-    On tolère des variations (ex: `from`, `text`) pour éviter les pannes Make.
+    On tolère des variations et payloads imbriqués (Make peut changer selon modules / tests).
     """
     message_id: Optional[str] = Field(None, description="Identifiant unique du message WhatsApp (anti-doublon).")
     client_id: Optional[str] = Field(None, description="Identifiant client (WhatsApp ID / téléphone).")
     texte: Optional[str] = Field(None, description="Demande client en texte libre.")
 
     class Config:
-        extra = "allow"  # important: accepte les champs inattendus (from, text, etc.)
+        extra = "allow"  # accepte champs inattendus
 
 
 class MissionOut(BaseModel):
@@ -210,33 +208,99 @@ def _get_any(d: Dict[str, Any], *keys: str) -> Optional[Any]:
     return None
 
 
+def _deep_get(obj: Any, path: List[Union[str, int]]) -> Optional[Any]:
+    """
+    Récupère un champ dans une structure imbriquée dict/list, sans crash.
+    Exemple: _deep_get(raw, ["entry", 0, "changes", 0, "value", "messages", 0, "from"])
+    """
+    cur = obj
+    try:
+        for p in path:
+            if isinstance(p, int):
+                if not isinstance(cur, list) or len(cur) <= p:
+                    return None
+                cur = cur[p]
+            else:
+                if not isinstance(cur, dict) or p not in cur:
+                    return None
+                cur = cur[p]
+        if cur in (None, "", []):
+            return None
+        return cur
+    except Exception:
+        return None
+
+
+def _first_in_list(x: Any) -> Optional[Any]:
+    if isinstance(x, list) and len(x) > 0:
+        return x[0]
+    return None
+
+
 def resolve_payload(payload: DemandeMission) -> Tuple[str, Optional[str], str]:
     """
-    Rend l'API tolérante si Make envoie des clés différentes.
+    Rend l'API tolérante si Make envoie des clés différentes ou un payload imbriqué.
     On cherche:
-      - client_id via client_id OU from OU wa_id...
-      - message_id via message_id OU id...
-      - texte via texte OU text.body...
+      - client_id via client_id OU from OU wa_id OU Messages[0].from OU webhook Meta
+      - message_id via message_id OU id OU Messages[0].id OU webhook Meta
+      - texte via texte OU text.body OU Messages[0].Text.Body OU webhook Meta (messages[0].text.body)
     """
     raw = payload.dict()
 
-    # message_id
+    # --- 1) message_id (plat)
     msg_id = payload.message_id or _get_any(raw, "id", "messageId", "messageID")
+
+    # --- 2) client_id (plat)
+    cid = payload.client_id or _get_any(raw, "from", "wa_id", "whatsapp_id", "whatsappId", "sender")
+
+    # --- 3) texte (plat)
+    txt = payload.texte or _get_any(raw, "text", "body", "message", "content")
+
+    # Si txt est dict du style {"body": "..."}
+    if isinstance(txt, dict):
+        txt = _get_any(txt, "body", "Body", "text", "Text")
+
+    # ----------------------------
+    # Fallback 1 : structure Make "Messages[]" (parfois Make envoie un objet complet)
+    # raw peut contenir: {"Messages": [{"from": "...", "id": "...", "Text": {"Body": "..."}}], ...}
+    # ----------------------------
+    messages = _get_any(raw, "Messages", "messages")
+    m0 = _first_in_list(messages)
+
+    if not msg_id and isinstance(m0, dict):
+        msg_id = _get_any(m0, "id", "message_id", "messageId")
+
+    if not cid and isinstance(m0, dict):
+        cid = _get_any(m0, "from", "wa_id", "sender", "client_id")
+
+    if (not txt or str(txt).strip() == "") and isinstance(m0, dict):
+        # Text.Body ou text.body
+        t1 = _deep_get(m0, ["Text", "Body"])
+        t2 = _deep_get(m0, ["text", "body"])
+        txt = t1 or t2 or _get_any(m0, "body", "text")
+
+    # ----------------------------
+    # Fallback 2 : webhook Meta complet (entry/changes/value/messages)
+    # entry[0].changes[0].value.messages[0].from
+    # entry[0].changes[0].value.messages[0].id
+    # entry[0].changes[0].value.messages[0].text.body
+    # ----------------------------
+    if not cid:
+        cid = _deep_get(raw, ["entry", 0, "changes", 0, "value", "messages", 0, "from"])
+    if not msg_id:
+        msg_id = _deep_get(raw, ["entry", 0, "changes", 0, "value", "messages", 0, "id"])
+    if (not txt or str(txt).strip() == ""):
+        txt = _deep_get(raw, ["entry", 0, "changes", 0, "value", "messages", 0, "text", "body"]) or ""
+
+    # Normalisations
     if isinstance(msg_id, (int, float)):
         msg_id = str(msg_id)
     msg_id = (str(msg_id).strip() if msg_id else None) or None
 
-    # client_id
-    cid = payload.client_id or _get_any(raw, "from", "wa_id", "whatsapp_id", "whatsappId", "sender")
     if isinstance(cid, (int, float)):
         cid = str(cid)
     cid = normalize_client_id(str(cid)) if cid else ""
 
-    # texte
-    txt = payload.texte or _get_any(raw, "text", "body", "message", "content")
-    # cas où Make envoie {"text": {"body": "..."}}
-    if isinstance(txt, dict):
-        txt = _get_any(txt, "body", "Body", "text", "Text")
     txt = (str(txt).strip() if txt else "")
 
     return cid, msg_id, txt
@@ -491,10 +555,14 @@ def mission_demande(payload: DemandeMission) -> MissionOut:
     client_id, message_id, texte = resolve_payload(payload)
 
     if not client_id:
-        _log("bad_payload_no_client_id", {"payload": payload.dict()})
+        # Pour aider au debug, on logge les clés reçues si DEBUG=1
+        _log("bad_payload_no_client_id", {
+            "keys": list(payload.dict().keys()),
+            "payload": payload.dict()
+        })
         raise HTTPException(
             status_code=422,
-            detail="client_id manquant (Make: mappe Messages[1].from ou Contacts[1].WhatsApp ID)"
+            detail="client_id manquant. Côté Make: mappe Messages[1].from (ou Contacts[1].WhatsApp ID si dispo)."
         )
 
     if anti_loop_ignore(client_id):
@@ -507,7 +575,7 @@ def mission_demande(payload: DemandeMission) -> MissionOut:
 
     should_process_now, merged = buffer_append_and_maybe_flush(client_id, texte)
 
-    # Important: si tu branches HTTP -> Send a message direct, ajoute un filtre dans Make:
+    # Si tu branches HTTP -> Send a message direct, filtre Make:
     # n'envoie vers WhatsApp que si statut != "buffering"
     if not should_process_now:
         return MissionOut(
@@ -528,7 +596,7 @@ def mission_demande(payload: DemandeMission) -> MissionOut:
     intent = detect_intent(merged_request)
     prix, resume, conditions = _simple_pricing(merged_request, intent)
 
-    # Arrondi monétaire forcé (évite 325.78000000000003)
+    # Arrondi monétaire forcé
     prix = safe_round_eur(prix)
 
     mission_id = create_mission(
