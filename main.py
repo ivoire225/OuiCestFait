@@ -1,3 +1,11 @@
+# main.py — OuiCestFait (Option A, robuste Make/WhatsApp)
+# Fixes:
+# - Plus de champs vides: même en "buffering", on renvoie prix/délai/conditions calculés.
+# - Buffer désactivé par défaut (CLIENT_BUFFER_WINDOW_SEC=0), réactivable via variable d'env.
+# - Tolérance forte sur les payloads (from/From, Body content, Messages[], webhook Meta).
+# - Déduplication: message_id si fourni + "soft dedup" si message_id absent.
+# - Support JSON + form-data + texte brut.
+
 from __future__ import annotations
 
 import os
@@ -5,12 +13,19 @@ import re
 import json
 import time
 import sqlite3
+import hashlib
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Dict, Any, List, Tuple, Union
 
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field
+
+# Compat Pydantic v1/v2
+try:
+    from pydantic import ConfigDict  # type: ignore
+except Exception:
+    ConfigDict = None  # type: ignore
 
 
 # =========================
@@ -20,11 +35,11 @@ from pydantic import BaseModel, Field, ConfigDict
 APP_NAME = "OuiCestFait"
 DB_PATH = os.getenv("DB_PATH", "ouicestfait.db")
 
-# Fenêtre pour regrouper plusieurs messages d’un même client (secondes)
-CLIENT_BUFFER_WINDOW_SEC = int(os.getenv("CLIENT_BUFFER_WINDOW_SEC", "25"))
+# Par défaut: 0 => offre immédiate.
+# Pour regrouper plusieurs messages: mets par exemple 15 ou 25 sur Railway.
+CLIENT_BUFFER_WINDOW_SEC = int(os.getenv("CLIENT_BUFFER_WINDOW_SEC", "0"))
 
-# Optionnel: éviter de répondre à ton propre numéro (anti-boucle complémentaire)
-# Exemple: "33759055781" (sans espaces)
+# Anti-boucle optionnel si tu connais ton propre numéro (sans + ni espaces)
 WHATSAPP_OWN_NUMBER = os.getenv("WHATSAPP_OWN_NUMBER", "").strip()
 
 # Pricing (base)
@@ -32,32 +47,35 @@ MIN_PRICE_EUR = Decimal(os.getenv("MIN_PRICE_EUR", "25"))
 URGENT_BASE_EUR = Decimal(os.getenv("URGENT_BASE_EUR", "150"))
 LONG_DISTANCE_BASE_EUR = Decimal(os.getenv("LONG_DISTANCE_BASE_EUR", "300"))
 
+# Soft-dedup quand message_id n'est pas fourni
+SOFT_DEDUP_WINDOW_SEC = int(os.getenv("SOFT_DEDUP_WINDOW_SEC", "12"))
+
 # Debug (log en DB)
 DEBUG = os.getenv("DEBUG", "0") == "1"
-DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "").strip()  # optionnel: protège /debug/* si rempli
+DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "").strip()
 
 
 # =========================
 # App
 # =========================
 
-app = FastAPI(title=f"{APP_NAME} API", version="1.3.0")
+app = FastAPI(title=f"{APP_NAME} API", version="1.3.2")
 
 
 # =========================
-# Modèles Pydantic (Pydantic v2)
+# Modèles Pydantic
 # =========================
 
 class DemandeMission(BaseModel):
-    """
-    Requête reçue depuis Make/WhatsApp.
-    On tolère des variations et payloads imbriqués (Make peut changer selon modules / tests).
-    """
-    model_config = ConfigDict(extra="allow")
+    message_id: Optional[str] = Field(None)
+    client_id: Optional[str] = Field(None)
+    texte: Optional[str] = Field(None)
 
-    message_id: Optional[str] = Field(None, description="Identifiant unique du message WhatsApp (anti-doublon).")
-    client_id: Optional[str] = Field(None, description="Identifiant client (WhatsApp ID / téléphone).")
-    texte: Optional[str] = Field(None, description="Demande client en texte libre.")
+    if ConfigDict is not None:
+        model_config = ConfigDict(extra="allow")  # pydantic v2
+    else:
+        class Config:
+            extra = "allow"
 
 
 class MissionOut(BaseModel):
@@ -90,6 +108,10 @@ def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def init_db() -> None:
@@ -140,6 +162,16 @@ def init_db() -> None:
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS soft_dedup (
+        k TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL
+    )
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_missions_client_id ON missions(client_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_missions_created_at ON missions(created_at)")
+
     conn.commit()
     conn.close()
 
@@ -150,20 +182,6 @@ init_db()
 # =========================
 # Utils
 # =========================
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def normalize_client_id(client_id: str) -> str:
-    x = (client_id or "").strip()
-    x = x.replace(" ", "").replace("+", "")
-    return x
-
-
-def safe_round_eur(value: Decimal) -> Decimal:
-    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
 
 def _log(kind: str, payload: Dict[str, Any]) -> None:
     if not DEBUG:
@@ -180,23 +198,26 @@ def _log(kind: str, payload: Dict[str, Any]) -> None:
         pass
 
 
+def normalize_client_id(client_id: str) -> str:
+    x = (client_id or "").strip()
+    x = x.replace(" ", "").replace("+", "")
+    return x
+
+
+def safe_round_eur(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
 def _norm_key(k: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (k or "").lower())
 
 
 def _get_any_fuzzy(d: Dict[str, Any], *keys: str) -> Optional[Any]:
-    """
-    Récupère une valeur dans un dict en tolérant :
-    - casse différente (From vs from)
-    - espaces/underscores/ponctuation (Body content, body_content, BodyContent, etc.)
-    """
     if not isinstance(d, dict):
         return None
-
     for k in keys:
         if k in d and d[k] not in (None, "", [], {}):
             return d[k]
-
     idx = {_norm_key(str(k)): k for k in d.keys()}
     for k in keys:
         nk = _norm_key(k)
@@ -208,12 +229,6 @@ def _get_any_fuzzy(d: Dict[str, Any], *keys: str) -> Optional[Any]:
 
 
 def _deep_get(obj: Any, path: List[Union[str, int]]) -> Optional[Any]:
-    """
-    Récupère un champ dans une structure imbriquée dict/list, sans crash.
-    Tolère aussi des clés "Entry"/"entry", "From"/"from", etc.
-    Exemple:
-      _deep_get(raw, ["entry", 0, "changes", 0, "value", "messages", 0, "from"])
-    """
     cur = obj
     try:
         for p in path:
@@ -249,41 +264,30 @@ def _first_in_list(x: Any) -> Optional[Any]:
     return None
 
 
-def resolve_payload(payload: DemandeMission) -> Tuple[str, Optional[str], str]:
-    """
-    Rend l'API tolérante si Make envoie des clés différentes ou un payload imbriqué.
-    On cherche:
-      - client_id via client_id / from / From / wa_id / Contacts[] / webhook Meta
-      - message_id via message_id / id / Messages[0].id / webhook Meta
-      - texte via texte / text.body / Messages[0].Text.Body / Body content / webhook Meta
-    """
-    raw = payload.model_dump()
-
-    msg_id: Optional[Any] = payload.message_id or _get_any_fuzzy(raw, "message_id", "messageId", "messageID", "id", "Message ID", "MessageId")
-    cid: Optional[Any] = payload.client_id or _get_any_fuzzy(raw, "client_id", "clientId", "from", "From", "wa_id", "waId", "whatsapp_id", "WhatsApp ID", "sender")
+def resolve_payload(payload: DemandeMission) -> Tuple[str, Optional[str], str, Dict[str, Any]]:
+    raw = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+    msg_id: Optional[Any] = payload.message_id or _get_any_fuzzy(raw, "message_id", "messageId", "id", "Message ID")
+    cid: Optional[Any] = payload.client_id or _get_any_fuzzy(raw, "client_id", "clientId", "from", "From", "wa_id", "waId", "sender")
     txt: Optional[Any] = payload.texte or _get_any_fuzzy(raw, "texte", "text", "Text", "body", "Body", "Body content", "content", "message")
 
     if isinstance(txt, dict):
         txt = _get_any_fuzzy(txt, "body", "Body", "text", "Text")
 
-    # Wrappers fréquents dans Make (data/payload/body/request)
     for wrapper_key in ("data", "payload", "body", "request", "input"):
         w = _get_any_fuzzy(raw, wrapper_key)
         if isinstance(w, dict):
             if not msg_id:
                 msg_id = _get_any_fuzzy(w, "message_id", "messageId", "id", "Message ID")
             if not cid:
-                cid = _get_any_fuzzy(w, "client_id", "from", "From", "wa_id", "WhatsApp ID", "sender")
+                cid = _get_any_fuzzy(w, "client_id", "from", "From", "wa_id", "sender")
             if (not txt or str(txt).strip() == ""):
                 t2 = _get_any_fuzzy(w, "texte", "text", "body", "Body", "Body content", "message", "content")
                 if isinstance(t2, dict):
                     t2 = _get_any_fuzzy(t2, "body", "Body")
                 txt = t2 or txt
 
-    # Fallback Make "Messages[]"
     messages = _get_any_fuzzy(raw, "Messages", "messages")
     m0 = _first_in_list(messages)
-
     if isinstance(m0, dict):
         if not msg_id:
             msg_id = _get_any_fuzzy(m0, "id", "message_id", "messageId", "Message ID")
@@ -297,13 +301,12 @@ def resolve_payload(payload: DemandeMission) -> Tuple[str, Optional[str], str]:
                 or ""
             )
 
-    # Fallback Make "Contacts[]"
     contacts = _get_any_fuzzy(raw, "Contacts", "contacts", "contact")
     c0 = _first_in_list(contacts)
     if isinstance(c0, dict) and not cid:
         cid = _get_any_fuzzy(c0, "wa_id", "waId", "WhatsApp ID", "from", "From", "id")
 
-    # Fallback Webhook Meta complet (entry/changes/value/messages | contacts)
+    # Webhook Meta
     if not cid:
         cid = (
             _deep_get(raw, ["entry", 0, "changes", 0, "value", "messages", 0, "from"])
@@ -314,18 +317,17 @@ def resolve_payload(payload: DemandeMission) -> Tuple[str, Optional[str], str]:
     if (not txt or str(txt).strip() == ""):
         txt = _deep_get(raw, ["entry", 0, "changes", 0, "value", "messages", 0, "text", "body"]) or ""
 
-    # Normalisations
-    if isinstance(msg_id, (int, float)):
-        msg_id = str(msg_id)
     msg_id = (str(msg_id).strip() if msg_id else None) or None
-
-    if isinstance(cid, (int, float)):
-        cid = str(cid)
     cid = normalize_client_id(str(cid)) if cid else ""
-
     txt = (str(txt).strip() if txt else "")
 
-    return cid, msg_id, txt
+    diag = {
+        "has_message_id": bool(msg_id),
+        "has_client_id": bool(cid),
+        "has_text": bool(txt),
+        "buffer_window": CLIENT_BUFFER_WINDOW_SEC,
+    }
+    return cid, msg_id, txt, diag
 
 
 # =========================
@@ -335,19 +337,19 @@ def resolve_payload(payload: DemandeMission) -> Tuple[str, Optional[str], str]:
 def detect_intent(text: str) -> Dict[str, Any]:
     t = (text or "").lower()
 
-    if any(k in t for k in ["livraison", "colis", "document", "dossier", "remettre", "déposer"]):
+    if any(k in t for k in ["livraison", "colis", "document", "dossier", "remettre", "déposer", "deposer", "récupérer", "recuperer"]):
         type_detecte = "livraison"
-    elif any(k in t for k in ["courses", "supermarché", "acheter", "liste de courses"]):
+    elif any(k in t for k in ["courses", "supermarché", "supermarche", "acheter", "liste de courses"]):
         type_detecte = "courses"
-    elif any(k in t for k in ["transport", "déménagement", "véhicule", "conduire"]):
+    elif any(k in t for k in ["transport", "déménagement", "demenagement", "véhicule", "vehicule", "conduire"]):
         type_detecte = "transport"
     else:
         type_detecte = "conciergerie"
 
-    urgent = any(k in t for k in ["urgent", "urgence", "rapidement", "tout de suite", "sous 1h", "immédiat"])
+    urgent = any(k in t for k in ["urgent", "urgence", "rapidement", "tout de suite", "sous 1h", "immédiat", "immediat", "aujourd'hui", "aujourdhui", "ce soir", "dans l'heure"])
     delai_estime = "sous 1h" if urgent else "dans la journée"
 
-    zone_tarifaire = "IDF/Paris" if any(k in t for k in ["paris", "75"]) else None
+    zone_tarifaire = "IDF/Paris" if any(k in t for k in ["paris", "75", "île-de-france", "ile-de-france", "idf"]) else None
 
     return {
         "type_detecte": type_detecte,
@@ -360,12 +362,24 @@ def detect_intent(text: str) -> Dict[str, Any]:
 def _extract_city_pair(text: str) -> Optional[Tuple[str, str]]:
     if not text:
         return None
-    m = re.search(r"([A-Za-zÀ-ÿ'\- ]+)\s*(?:->|→)\s*([A-Za-zÀ-ÿ'\- ]+)", text)
+    s = text
+
+    m = re.search(r"([A-Za-zÀ-ÿ'\- ]+)\s*(?:->|→)\s*([A-Za-zÀ-ÿ'\- ]+)", s)
     if m:
         return (m.group(1).strip(), m.group(2).strip())
-    m = re.search(r"(?:de|depuis)\s+([A-Za-zÀ-ÿ'\- ]+)\s+(?:à|vers)\s+([A-Za-zÀ-ÿ'\- ]+)", text, re.IGNORECASE)
+
+    m = re.search(r"(?:de|depuis)\s+([A-Za-zÀ-ÿ'\- ]+)\s+(?:à|a|vers)\s+([A-Za-zÀ-ÿ'\- ]+)", s, re.IGNORECASE)
     if m:
         return (m.group(1).strip(), m.group(2).strip())
+
+    m = re.search(r"(?:récupérer|recuperer|prendre|pickup|pick up).{0,60}?\b(?:à|a)\s+([A-Za-zÀ-ÿ'\- ]+).{0,120}?\b(?:livrer|deliver|déposer|deposer|remettre).{0,60}?\b(?:à|a)\s+([A-Za-zÀ-ÿ'\- ]+)", s, re.IGNORECASE)
+    if m:
+        return (m.group(1).strip(), m.group(2).strip())
+
+    m = re.search(r"\b(?:à|a)\s+([A-Za-zÀ-ÿ'\- ]+).{0,80}?\b(?:à|a|vers)\s+([A-Za-zÀ-ÿ'\- ]+)", s, re.IGNORECASE)
+    if m:
+        return (m.group(1).strip(), m.group(2).strip())
+
     return None
 
 
@@ -380,13 +394,16 @@ def _simple_pricing(text: str, intent: Dict[str, Any]) -> Tuple[Decimal, str, st
 
     price = URGENT_BASE_EUR if urgent else Decimal("80")
 
+    long_distance = False
     pair = _extract_city_pair(t)
     if pair:
-        _, to = pair
-        if any(k in to.lower() for k in [
-            "lyon", "marseille", "lille", "bordeaux", "nantes", "toulouse", "strasbourg", "orleans"
-        ]):
-            price = max(price, LONG_DISTANCE_BASE_EUR)
+        frm, to = pair
+        if frm.strip().lower() != to.strip().lower():
+            big = {"paris","lyon","marseille","lille","bordeaux","nantes","toulouse","strasbourg","orleans","nice","rennes","grenoble","montpellier"}
+            if (frm.strip().lower() in big) or (to.strip().lower() in big):
+                long_distance = True
+    if long_distance:
+        price = max(price, LONG_DISTANCE_BASE_EUR)
 
     if type_detecte == "courses":
         price += Decimal("30")
@@ -394,6 +411,7 @@ def _simple_pricing(text: str, intent: Dict[str, Any]) -> Tuple[Decimal, str, st
         price += Decimal("80")
 
     price = max(price, MIN_PRICE_EUR)
+    price = safe_round_eur(price)
 
     conditions = (
         "Paiement 100% à l'avance.\n"
@@ -406,19 +424,23 @@ def _simple_pricing(text: str, intent: Dict[str, Any]) -> Tuple[Decimal, str, st
 
 
 # =========================
-# Anti-boucle / dédup
+# Dédup & buffer
 # =========================
+
+def anti_loop_ignore(client_id: str) -> bool:
+    if not WHATSAPP_OWN_NUMBER:
+        return False
+    return normalize_client_id(client_id) == normalize_client_id(WHATSAPP_OWN_NUMBER)
+
 
 def dedup_check_and_store(message_id: Optional[str], client_id: str) -> bool:
     if not message_id:
         return False
-
     conn = _db()
     cur = conn.cursor()
 
     cur.execute("SELECT message_id FROM message_dedup WHERE message_id = ?", (message_id,))
-    row = cur.fetchone()
-    if row:
+    if cur.fetchone():
         conn.close()
         return True
 
@@ -431,15 +453,32 @@ def dedup_check_and_store(message_id: Optional[str], client_id: str) -> bool:
     return False
 
 
-def anti_loop_ignore(client_id: str) -> bool:
-    if not WHATSAPP_OWN_NUMBER:
+def soft_dedup_check_and_store(client_id: str, texte: str) -> bool:
+    if SOFT_DEDUP_WINDOW_SEC <= 0:
         return False
-    return normalize_client_id(client_id) == normalize_client_id(WHATSAPP_OWN_NUMBER)
 
+    now = int(time.time())
+    bucket = now // SOFT_DEDUP_WINDOW_SEC
+    key_raw = f"{client_id}|{texte}|{bucket}"
+    k = hashlib.sha1(key_raw.encode("utf-8", errors="ignore")).hexdigest()
 
-# =========================
-# Buffer multi-messages client
-# =========================
+    conn = _db()
+    cur = conn.cursor()
+
+    purge_before = now - (SOFT_DEDUP_WINDOW_SEC * 3)
+    cur.execute("DELETE FROM soft_dedup WHERE created_at < ?", (purge_before,))
+
+    cur.execute("SELECT k FROM soft_dedup WHERE k = ?", (k,))
+    if cur.fetchone():
+        conn.commit()
+        conn.close()
+        return True
+
+    cur.execute("INSERT INTO soft_dedup(k, created_at) VALUES(?,?)", (k, now))
+    conn.commit()
+    conn.close()
+    return False
+
 
 def buffer_append_and_maybe_flush(client_id: str, new_text: str) -> Tuple[bool, str]:
     now = int(time.time())
@@ -447,14 +486,13 @@ def buffer_append_and_maybe_flush(client_id: str, new_text: str) -> Tuple[bool, 
     if not new_text:
         return (False, "")
 
-    # Si la fenêtre = 0 => traitement immédiat
     if CLIENT_BUFFER_WINDOW_SEC <= 0:
         return (True, new_text)
 
     conn = _db()
     cur = conn.cursor()
 
-    cur.execute("SELECT buffer_text, first_at, last_at FROM client_message_buffer WHERE client_id = ?", (client_id,))
+    cur.execute("SELECT buffer_text, last_at FROM client_message_buffer WHERE client_id = ?", (client_id,))
     row = cur.fetchone()
 
     if not row:
@@ -471,7 +509,6 @@ def buffer_append_and_maybe_flush(client_id: str, new_text: str) -> Tuple[bool, 
 
     if now - last_at > CLIENT_BUFFER_WINDOW_SEC:
         merged_prev = (buffer_text or "").strip()
-
         cur.execute(
             "UPDATE client_message_buffer SET buffer_text=?, first_at=?, last_at=? WHERE client_id=?",
             (new_text, now, now, client_id),
@@ -536,33 +573,6 @@ def update_mission_status(mission_id: int, statut: str) -> None:
     conn.close()
 
 
-def get_client_history(client_id: str, limit: int = 10) -> List[MissionHistoryItem]:
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, created_at, statut, resume_client, prix_recommande_eur, delai_estime, type_detecte
-        FROM missions
-        WHERE client_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-    """, (client_id, limit))
-    rows = cur.fetchall()
-    conn.close()
-
-    out: List[MissionHistoryItem] = []
-    for r in rows:
-        out.append(MissionHistoryItem(
-            mission_id=int(r["id"]),
-            created_at=str(r["created_at"]),
-            statut=str(r["statut"]),
-            resume_client=str(r["resume_client"] or ""),
-            prix_recommande_eur=float(r["prix_recommande_eur"]) if r["prix_recommande_eur"] is not None else None,
-            delai_estime=str(r["delai_estime"] or "") if r["delai_estime"] is not None else None,
-            type_detecte=str(r["type_detecte"] or "") if r["type_detecte"] is not None else None,
-        ))
-    return out
-
-
 # =========================
 # API
 # =========================
@@ -574,22 +584,13 @@ def health() -> Dict[str, Any]:
 
 @app.post("/mission/demande", response_model=MissionOut)
 async def mission_demande(request: Request) -> MissionOut:
-    """
-    Endpoint principal (Option A).
-    Accepte:
-    - JSON (recommandé)
-    - form-data / x-www-form-urlencoded (si Make est configuré ainsi)
-    - raw text (fallback)
-    """
     raw: Any = None
 
-    # 1) JSON
     try:
         raw = await request.json()
     except Exception:
         raw = None
 
-    # 2) Form data
     if raw is None:
         try:
             form = await request.form()
@@ -597,7 +598,6 @@ async def mission_demande(request: Request) -> MissionOut:
         except Exception:
             raw = None
 
-    # 3) Body texte brut
     if raw is None:
         body_bytes = await request.body()
         body_text = body_bytes.decode("utf-8", errors="ignore").strip()
@@ -609,22 +609,13 @@ async def mission_demande(request: Request) -> MissionOut:
         else:
             raw = {}
 
-    payload = DemandeMission.model_validate(raw)
-    client_id, message_id, texte = resolve_payload(payload)
+    payload = DemandeMission.model_validate(raw) if hasattr(DemandeMission, "model_validate") else DemandeMission(**raw)
+    client_id, message_id, texte, _ = resolve_payload(payload)
 
     if not client_id:
-        _log("bad_payload_no_client_id", {
-            "headers": dict(request.headers),
-            "keys": list(payload.model_dump().keys()),
-            "payload": payload.model_dump(),
-        })
-        raise HTTPException(
-            status_code=422,
-            detail="client_id manquant. Côté Make: mappe Messages[1].from (ou Contacts[1].WhatsApp ID)."
-        )
+        raise HTTPException(status_code=422, detail="client_id/from manquant (WhatsApp ID).")
 
     if anti_loop_ignore(client_id):
-        _log("ignore_self", {"client_id": client_id})
         return MissionOut(
             mission_id=0,
             client_id=client_id,
@@ -638,11 +629,23 @@ async def mission_demande(request: Request) -> MissionOut:
         )
 
     if dedup_check_and_store(message_id, client_id):
-        _log("dedup_hit", {"client_id": client_id, "message_id": message_id})
         return MissionOut(
             mission_id=0,
             client_id=client_id,
-            resume_client="Message déjà traité (déduplication).",
+            resume_client="Message déjà traité.",
+            prix_recommande_eur=None,
+            delai_estime="",
+            conditions=None,
+            zone_tarifaire=None,
+            type_detecte=None,
+            statut="duplicate_message",
+        )
+
+    if (not message_id) and soft_dedup_check_and_store(client_id, texte):
+        return MissionOut(
+            mission_id=0,
+            client_id=client_id,
+            resume_client="Message déjà reçu (anti-doublon).",
             prix_recommande_eur=None,
             delai_estime="",
             conditions=None,
@@ -652,33 +655,27 @@ async def mission_demande(request: Request) -> MissionOut:
         )
 
     should_process_now, merged = buffer_append_and_maybe_flush(client_id, texte)
+    intent = detect_intent(merged)
+    prix, resume, conditions = _simple_pricing(merged, intent)
 
-    # Si tu branches HTTP -> Send a message direct, filtre Make:
-    # n'envoie vers WhatsApp que si statut != "buffering"
+    # ✅ Même en buffering : on renvoie des champs complets (plus de messages vides côté WhatsApp)
     if not should_process_now:
         return MissionOut(
             mission_id=0,
             client_id=client_id,
-            resume_client="Message reçu, analyse en cours…",
-            prix_recommande_eur=None,
-            delai_estime="",
-            conditions=None,
-            zone_tarifaire=None,
-            type_detecte=None,
+            resume_client=resume,
+            prix_recommande_eur=float(prix),
+            delai_estime=intent["delai_estime"],
+            conditions=conditions,
+            zone_tarifaire=intent["zone_tarifaire"],
+            type_detecte=intent["type_detecte"],
             statut="buffering",
         )
 
-    merged_request = merged
-    raw_request = texte
-
-    intent = detect_intent(merged_request)
-    prix, resume, conditions = _simple_pricing(merged_request, intent)
-    prix = safe_round_eur(prix)
-
     mission_id = create_mission(
         client_id=client_id,
-        raw_request=raw_request,
-        merged_request=merged_request,
+        raw_request=texte,
+        merged_request=merged,
         resume_client=resume,
         type_detecte=intent["type_detecte"],
         zone_tarifaire=intent["zone_tarifaire"],
@@ -708,46 +705,7 @@ def set_status(mission_id: int, statut: str) -> Dict[str, Any]:
     return {"ok": True, "mission_id": mission_id, "statut": statut}
 
 
-@app.get("/client/{client_id}/history", response_model=List[MissionHistoryItem])
-def client_history(client_id: str, limit: int = 10) -> List[MissionHistoryItem]:
-    client_id = normalize_client_id(client_id)
-    return get_client_history(client_id, limit=limit)
-
-
-@app.get("/debug/last")
-def debug_last(limit: int = 20, token: str = "") -> Dict[str, Any]:
-    """
-    Récupère les derniers logs (uniquement utile si DEBUG=1).
-    Si DEBUG_TOKEN est défini, ajoute ?token=... pour accéder.
-    """
-    if not DEBUG:
-        raise HTTPException(status_code=403, detail="DEBUG=0")
-    if DEBUG_TOKEN and token != DEBUG_TOKEN:
-        raise HTTPException(status_code=401, detail="bad_token")
-
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, kind, payload, created_at FROM audit_log ORDER BY id DESC LIMIT ?", (limit,))
-    rows = cur.fetchall()
-    conn.close()
-
-    out = []
-    for r in rows:
-        try:
-            payload = json.loads(r["payload"])
-        except Exception:
-            payload = r["payload"]
-        out.append({
-            "id": int(r["id"]),
-            "kind": str(r["kind"]),
-            "payload": payload,
-            "created_at": str(r["created_at"]),
-        })
-    return {"items": out, "count": len(out)}
-
-
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
