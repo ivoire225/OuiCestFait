@@ -85,9 +85,15 @@ IDF_CITIES = {
     "vitry-sur-seine", "vitry sur seine", "creteil", "créteil", "evry", "évry", "massy",
 }
 
-# Tarifs IDF (configurables)
+# Tarifs IDF (voiture, départ Mormant 77720)
+# - Règle simple (IDF interne uniquement): prix = max(IDF_MIN_EUR, IDF_EUR_PER_KM_CAR * km_total)
+# - Urgent: x IDF_URGENT_MULT
+# (Les variables IDF_STANDARD_EUR/IDF_URGENT_EUR restent comme filet de sécurité si la distance est indisponible.)
 IDF_STANDARD_EUR = Decimal(os.getenv("IDF_STANDARD_EUR", "80"))
 IDF_URGENT_EUR = Decimal(os.getenv("IDF_URGENT_EUR", "150"))
+IDF_EUR_PER_KM_CAR = Decimal(os.getenv("IDF_EUR_PER_KM_CAR", "1.80"))
+IDF_MIN_EUR = Decimal(os.getenv("IDF_MIN_EUR", "90"))
+IDF_URGENT_MULT = Decimal(os.getenv("IDF_URGENT_MULT", "1.25"))
 MIN_PRICE_EUR = Decimal(os.getenv("MIN_PRICE_EUR", "25"))
 
 # Hors IDF (règle validée)
@@ -96,6 +102,7 @@ PROV_EUR_PER_KM = Decimal(os.getenv("PROV_EUR_PER_KM", "1.0"))
 PROV_TOLL_MULT = Decimal(os.getenv("PROV_TOLL_MULT", "2.0"))
 PROV_MEAL_EUR = Decimal(os.getenv("PROV_MEAL_EUR", "30"))
 PROV_MARGIN_PCT = Decimal(os.getenv("PROV_MARGIN_PCT", "0.40"))  # +40%
+PROV_URGENT_MULT = Decimal(os.getenv("PROV_URGENT_MULT", "1.15"))
 
 # Suppléments Province (optionnels) — validés
 PROV_AR_PCT = Decimal(os.getenv("PROV_AR_PCT", "0.50"))        # +50%
@@ -133,7 +140,7 @@ CURRENCY_ROUND = Decimal("0.01")
 # App
 # =========================
 
-app = FastAPI(title=f"{APP_NAME} API", version="2.2.0")
+app = FastAPI(title=f"{APP_NAME} API", version="2.3.0")
 
 
 # =========================
@@ -572,9 +579,9 @@ def extract_route(text: str) -> Tuple[str, str]:
     if m:
         return m.group(1).strip(), m.group(2).strip()
 
-    # récupérer à X ... livrer à Y
+    # récupérer/enlever à X ... livrer à Y (robuste)
     m = re.search(
-        r"(?:r[ée]cup[ée]rer|recuperer|prendre|collecter).{0,90}?\b(?:à|au|aux)\s+(.+?)\b.{0,140}?\b(?:livrer|d[ée]poser|deposer|remettre).{0,90}?\b(?:à|au|aux)\s+(.+)",
+        r"(?:r[ée]cup[ée]rer|recuperer|prendre|collecter|enlever|enl[eè]ver|enl[eè]ve|enl[eè]vement|enlevement|ramasser|retirer).{0,120}?\b(?:à|au|aux)\s+(.+?)\b.{0,220}?\b(?:livrer|livraison|d[ée]poser|deposer|remettre).{0,120}?\b(?:à|au|aux)\s+(.+)",
         s,
         re.IGNORECASE,
     )
@@ -706,7 +713,7 @@ def buffer_append_and_maybe_flush(client_id: str, new_text: str) -> Tuple[bool, 
 
 def _ua() -> str:
     contact = NOMINATIM_EMAIL or "contact@exemple.tld"
-    return f"{APP_NAME}/2.2 ({contact})"
+    return f"{APP_NAME}/2.3 ({contact})"
 
 
 def _http_get_json(url: str, timeout: float) -> Any:
@@ -878,6 +885,60 @@ def compute_distance_km(origin: str, destination: str) -> Optional[float]:
     if km <= 0:
         return None
     return km
+def is_precise_place(s: str) -> bool:
+    """Heuristique simple: une adresse avec CP/numéro est plus 'verrouillable' qu'un nom de ville seul."""
+    if not s:
+        return False
+    t = (s or "").lower()
+    # code postal FR
+    if re.search(r"\b\d{5}\b", t):
+        return True
+    # présence de chiffre (numéro de rue, etc.)
+    if re.search(r"\b\d{1,4}\b", t):
+        return True
+    return False
+
+
+def place_is_base(place: str) -> bool:
+    if not place:
+        return False
+    t = (place or "").lower()
+    if BASE_POSTAL.lower() in t:
+        return True
+    if BASE_CITY.lower() in t:
+        return True
+    return _canon_addr(place) == _canon_addr(BASE_LOCATION)
+
+
+def compute_trip_distance_km(origin: str, destination: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Distance totale en voiture en partant de la base (Mormant 77720).
+
+    Retourne (km_total, km_base_vers_origin, km_origin_vers_destination).
+
+    - Si origin == base => km_total = base->destination
+    - Sinon => km_total = base->origin + origin->destination
+    """
+    o = (origin or BASE_LOCATION).strip()
+    d = (destination or BASE_LOCATION).strip()
+
+    # base -> destination (si origin non précisée ou égale à base)
+    if place_is_base(o):
+        leg_to_pickup = 0.0
+        leg_delivery = compute_distance_km(BASE_LOCATION, d)
+        if leg_delivery is None:
+            return None, None, None
+        return float(leg_delivery), float(leg_to_pickup), float(leg_delivery)
+
+    leg_to_pickup = compute_distance_km(BASE_LOCATION, o)
+    leg_delivery = compute_distance_km(o, d)
+
+    if leg_to_pickup is None or leg_delivery is None:
+        # On renvoie ce qu'on a (utile debug/log), mais total reste None
+        return None, leg_to_pickup, leg_delivery
+
+    km_total = float(leg_to_pickup) + float(leg_delivery)
+    return km_total, float(leg_to_pickup), float(leg_delivery)
+
 
 
 # =========================
@@ -944,17 +1005,42 @@ def detect_province_supplements(text: str) -> Tuple[Decimal, Decimal]:
     return extra_fixed, extra_pct
 
 
-def price_idf(urgent: bool) -> Decimal:
-    p = IDF_URGENT_EUR if urgent else IDF_STANDARD_EUR
+def price_idf(distance_km_total: Optional[float], urgent: bool) -> Decimal:
+    """Tarification IDF (voiture) en intégrant le départ Mormant 77720.
+
+    Règle:
+    - prix = max(IDF_MIN_EUR, IDF_EUR_PER_KM_CAR * km_total)
+    - urgent => x IDF_URGENT_MULT
+    - filet de sécurité: jamais en dessous de IDF_STANDARD_EUR / IDF_URGENT_EUR
+    """
+    fixed = IDF_URGENT_EUR if urgent else IDF_STANDARD_EUR
+
+    if distance_km_total is not None and float(distance_km_total) > 0:
+        km_d = Decimal(str(distance_km_total))
+        p = IDF_EUR_PER_KM_CAR * km_d
+        p = max(p, IDF_MIN_EUR, fixed)
+        if urgent:
+            p = p * IDF_URGENT_MULT
+            p = max(p, fixed)
+    else:
+        # si la distance n'est pas calculable, on applique un minimum sécurisé
+        p = max(IDF_MIN_EUR, fixed)
+        if urgent:
+            p = max(IDF_MIN_EUR * IDF_URGENT_MULT, fixed)
+
     p = max(p, MIN_PRICE_EUR)
     return d2(p)
 
 
-def price_province(distance_km: float, toll_eur: float, text: str) -> Decimal:
+def price_province(distance_km_total: float, toll_eur: float, text: str, urgent: bool) -> Decimal:
+    """Tarification hors IDF (voiture), total 'tout compris' sans demander le péage au client.
+
+    Règle validée:
+    - base = (PROV_EUR_PER_KM * km_total) + (PROV_TOLL_MULT * peage_estime) + PROV_MEAL_EUR + extras
+    - total = base * (1 + PROV_MARGIN_PCT)
+    - urgent => x PROV_URGENT_MULT
     """
-    base = (1€ * km) + (2 * péage) + 30€ + extras ; total = base * (1+40%)
-    """
-    km_d = Decimal(str(distance_km))
+    km_d = Decimal(str(distance_km_total))
     toll_d = Decimal(str(toll_eur))
 
     extra_fixed, extra_pct = detect_province_supplements(text)
@@ -962,6 +1048,9 @@ def price_province(distance_km: float, toll_eur: float, text: str) -> Decimal:
     base = (PROV_EUR_PER_KM * km_d) + (PROV_TOLL_MULT * toll_d) + PROV_MEAL_EUR + extra_fixed
     base = base * (Decimal("1") + extra_pct)
     total = base * (Decimal("1") + PROV_MARGIN_PCT)
+
+    if urgent:
+        total = total * PROV_URGENT_MULT
 
     total = max(total, MIN_PRICE_EUR)
     return d2(total)
@@ -1184,35 +1273,51 @@ async def mission_demande(request: Request) -> MissionOut:
 
     zone_tarifaire = "IDF" if idf_internal else "Hors IDF"
 
-    # Distance & péage
+    # Distance (voiture) en intégrant le départ Mormant 77720
     distance_km: Optional[float] = None
+    km_base_to_pickup: Optional[float] = None
+    km_pickup_to_drop: Optional[float] = None
     toll_est_eur: Optional[float] = None
 
-    if not idf_internal and GEO_ENABLE:
+    if GEO_ENABLE:
         # Appels réseau => thread (ne bloque pas l'event loop)
         try:
-            distance_km = await asyncio.to_thread(compute_distance_km, origin, destination)
+            distance_km, km_base_to_pickup, km_pickup_to_drop = await asyncio.to_thread(
+                compute_trip_distance_km, origin, destination
+            )
         except Exception:
             distance_km = None
 
-        if distance_km is not None and TOLL_EST_ENABLE:
-            toll_est_eur = estimate_toll_eur(distance_km, merged)
+    # Péage estimé (gratuit) — seulement hors IDF
+    if (not idf_internal) and (distance_km is not None) and TOLL_EST_ENABLE:
+        toll_est_eur = estimate_toll_eur(distance_km, merged)
+    elif distance_km is not None:
+        toll_est_eur = 0.0
 
     # Pricing
     prix: Optional[Decimal] = None
     conditions = build_conditions()
 
     if idf_internal:
-        prix = price_idf(urgent)
+        # IDF: on calcule le prix même si l'adresse n'est pas complète (distance ville->ville)
+        prix = price_idf(distance_km, urgent)
     else:
-        # Si on ne peut pas calculer la distance => on demande juste adresses complètes
+        # Hors IDF: si on ne peut pas calculer la distance => on demande les adresses complètes
         if distance_km is None:
             prix = None
         else:
             toll_est_eur = toll_est_eur if toll_est_eur is not None else 0.0
-            prix = price_province(distance_km, toll_est_eur, merged)
+            prix = price_province(distance_km, toll_est_eur, merged, urgent)
 
     resume = summarize(merged)
+    resume_out = resume
+    if prix is not None and distance_km is not None:
+        if (not is_precise_place(origin)) or (not is_precise_place(destination)):
+            resume_out = (
+                resume
+                + "\n\nNote : montant basé sur la distance routière entre les villes. "
+                + "L’adresse exacte peut ajuster légèrement."
+            )
     ref = make_ref()
 
     # Même en buffering : on renvoie une réponse exploitable (important WhatsApp/Make)
@@ -1227,7 +1332,7 @@ async def mission_demande(request: Request) -> MissionOut:
             message_id=message_id,
             raw_request=texte,
             merged_request=merged,
-            resume_client=resume,
+            resume_client=resume_out,
             type_detecte=type_detecte,
             zone_tarifaire=zone_tarifaire,
             delai_estime=delai_estime,
@@ -1247,6 +1352,8 @@ async def mission_demande(request: Request) -> MissionOut:
         "destination": destination,
         "idf_internal": idf_internal,
         "distance_km": distance_km,
+        "km_base_to_pickup": km_base_to_pickup,
+        "km_pickup_to_drop": km_pickup_to_drop,
         "toll_est_eur": toll_est_eur,
         "prix": float(prix) if prix is not None else None,
         "statut": statut,
@@ -1277,7 +1384,7 @@ async def mission_demande(request: Request) -> MissionOut:
     return MissionOut(
         mission_id=mission_id,
         client_id=client_id,
-        resume_client=resume,
+        resume_client=resume_out,
         prix_recommande_eur=float(prix) if prix is not None else None,
         delai_estime=delai_estime,
         conditions=conditions,
