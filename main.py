@@ -1,4 +1,4 @@
-# main.py — OuiCestFait (Option A — rapidité/volume/fiabilité)
+﻿# main.py — OuiCestFait (Option A — rapidité/volume/fiabilité)
 # - Tarification IDF vs Hors IDF
 # - Hors IDF: distance auto (gratuit) + péage estimé (gratuit) => prix total sans demander le péage au client
 # - Anti-doublon (message_id + soft dedup), rate limiting, DB WAL/busy_timeout
@@ -7,7 +7,6 @@
 # - Urgent keywords => délai "sous 1h" sinon "dans la journée"
 #
 # Dépendances (requirements.txt): fastapi, uvicorn, pydantic, python-multipart (si form-data)
-# :contentReference[oaicite:1]{index=1}
 
 from __future__ import annotations
 
@@ -140,7 +139,7 @@ CURRENCY_ROUND = Decimal("0.01")
 # App
 # =========================
 
-app = FastAPI(title=f"{APP_NAME} API", version="2.3.0")
+app = FastAPI(title=f"{APP_NAME} API", version="2.3.1")
 
 
 # =========================
@@ -609,26 +608,30 @@ def anti_loop_ignore(client_id: str) -> bool:
 
 
 def dedup_check_and_store(message_id: Optional[str], client_id: str) -> bool:
+    """Retourne True si le message_id a déjà été vu (donc à ignorer)."""
     if not message_id:
         return False
 
     now = _now_ts()
     conn = _db()
     cur = conn.cursor()
+    try:
+        # purge TTL
+        cur.execute("DELETE FROM message_dedup WHERE created_at < ?", (now - DEDUP_TTL_SEC,))
+        # check exist
+        cur.execute("SELECT 1 FROM message_dedup WHERE message_id = ? LIMIT 1", (message_id,))
+        if cur.fetchone():
+            conn.commit()
+            return True
 
-    cur.execute("DELETE FROM message_dedup WHERE created_at < ?", (now - DEDUP_TTL_SEC,))
-    cur.execute("SELECT message_id FROM message_dedup WHERE message_id = ? LIMIT 1", (message_id,))
-    if cur.fetchone():
+        cur.execute(
+            "INSERT OR REPLACE INTO message_dedup(message_id, client_id, created_at) VALUES(?,?,?)",
+            (message_id, client_id, now),
+        )
+        conn.commit()
+        return False
+    finally:
         conn.close()
-        return True
-
-    cur.execute(
-        "INSERT OR REPLACE INTO message_dedup(message_id, client_id, created_at) VALUES(?,?,?)",
-        (message_id, client_id, now),
-    )
-    conn.commit()
-    conn.close()
-    return False
 
 
 def soft_dedup_check_and_store(client_id: str, texte: str) -> bool:
@@ -659,6 +662,15 @@ def soft_dedup_check_and_store(client_id: str, texte: str) -> bool:
 
 
 def buffer_append_and_maybe_flush(client_id: str, new_text: str) -> Tuple[bool, str]:
+    """Buffer optionnel pour regrouper plusieurs messages proches.
+
+    - Si CLIENT_BUFFER_WINDOW_SEC <= 0 : traitement immédiat => (True, new_text)
+    - Sinon :
+        * on cumule le texte dans client_message_buffer
+        * dès que (now - first_at) >= window, on FLUSH le buffer (en incluant le message courant),
+          puis on supprime l'entrée => (True, merged)
+        * sinon => (False, merged_buffer)
+    """
     now = _now_ts()
     new_text = (new_text or "").strip()
     if not new_text:
@@ -669,42 +681,38 @@ def buffer_append_and_maybe_flush(client_id: str, new_text: str) -> Tuple[bool, 
 
     conn = _db()
     cur = conn.cursor()
+    try:
+        cur.execute("SELECT buffer_text, first_at FROM client_message_buffer WHERE client_id = ?", (client_id,))
+        row = cur.fetchone()
 
-    cur.execute("SELECT buffer_text, first_at, last_at FROM client_message_buffer WHERE client_id = ?", (client_id,))
-    row = cur.fetchone()
+        if not row:
+            cur.execute(
+                "INSERT INTO client_message_buffer(client_id, buffer_text, first_at, last_at) VALUES(?,?,?,?)",
+                (client_id, new_text, now, now),
+            )
+            conn.commit()
+            return (False, new_text)
 
-    if not row:
+        buffer_text = (row["buffer_text"] or "").strip()
+        first_at = int(row["first_at"])
+
+        merged = ("\n".join([buffer_text, new_text])).strip() if buffer_text else new_text
+
+        # fenêtre écoulée depuis le premier message => flush en incluant le message courant
+        if now - first_at >= CLIENT_BUFFER_WINDOW_SEC:
+            cur.execute("DELETE FROM client_message_buffer WHERE client_id = ?", (client_id,))
+            conn.commit()
+            return (True, merged)
+
+        # sinon: on continue à bufferiser
         cur.execute(
-            "INSERT INTO client_message_buffer(client_id, buffer_text, first_at, last_at) VALUES(?,?,?,?)",
-            (client_id, new_text, now, now),
+            "UPDATE client_message_buffer SET buffer_text=?, last_at=? WHERE client_id=?",
+            (merged, now, client_id),
         )
         conn.commit()
+        return (False, merged)
+    finally:
         conn.close()
-        return (False, new_text)
-
-    buffer_text = row["buffer_text"]
-    first_at = int(row["first_at"])
-    last_at = int(row["last_at"])
-
-    # si la fenêtre est dépassée depuis le premier message => flush
-    if now - first_at >= CLIENT_BUFFER_WINDOW_SEC:
-        merged_prev = (buffer_text or "").strip()
-        cur.execute(
-            "UPDATE client_message_buffer SET buffer_text=?, first_at=?, last_at=? WHERE client_id=?",
-            (new_text, now, now, client_id),
-        )
-        conn.commit()
-        conn.close()
-        return (True, merged_prev)
-
-    merged = (buffer_text + "\n" + new_text).strip()
-    cur.execute(
-        "UPDATE client_message_buffer SET buffer_text=?, last_at=? WHERE client_id=?",
-        (merged, now, client_id),
-    )
-    conn.commit()
-    conn.close()
-    return (False, merged)
 
 
 # =========================
@@ -885,6 +893,8 @@ def compute_distance_km(origin: str, destination: str) -> Optional[float]:
     if km <= 0:
         return None
     return km
+
+
 def is_precise_place(s: str) -> bool:
     """Heuristique simple: une adresse avec CP/numéro est plus 'verrouillable' qu'un nom de ville seul."""
     if not s:
@@ -938,7 +948,6 @@ def compute_trip_distance_km(origin: str, destination: str) -> Tuple[Optional[fl
 
     km_total = float(leg_to_pickup) + float(leg_delivery)
     return km_total, float(leg_to_pickup), float(leg_delivery)
-
 
 
 # =========================
@@ -1273,6 +1282,34 @@ async def mission_demande(request: Request) -> MissionOut:
 
     zone_tarifaire = "IDF" if idf_internal else "Hors IDF"
 
+    # Si buffering activé et fenêtre non atteinte : on répond sans faire d'appels réseau (GEO/OSRM)
+    if not should_process_now:
+        resume_buf = summarize(merged)
+        _log("mission_buffering", {
+            "client_id": client_id,
+            "message_id": message_id,
+            "origin": origin,
+            "destination": destination,
+            "idf_internal": idf_internal,
+            "statut": "buffering",
+        })
+        return MissionOut(
+            mission_id=0,
+            client_id=client_id,
+            resume_client=(
+                f"{resume_buf}\n\n"
+                "Message reçu. Ajoute les infos manquantes (adresses complètes, contraintes, volume/fragile, "
+                "aller-retour, etc.) et je calcule le montant."
+            ),
+            prix_recommande_eur=None,
+            delai_estime=delai_estime,
+            conditions=None,
+            zone_tarifaire=zone_tarifaire,
+            type_detecte=type_detecte,
+            statut="buffering",
+            ref_mission=None,
+        )
+
     # Distance (voiture) en intégrant le départ Mormant 77720
     distance_km: Optional[float] = None
     km_base_to_pickup: Optional[float] = None
@@ -1320,30 +1357,25 @@ async def mission_demande(request: Request) -> MissionOut:
             )
     ref = make_ref()
 
-    # Même en buffering : on renvoie une réponse exploitable (important WhatsApp/Make)
-    if not should_process_now:
-        statut = "buffering"
-        mission_id = 0
-    else:
-        statut = "en_attente_validation"
-        mission_id = create_mission(
-            ref=ref,
-            client_id=client_id,
-            message_id=message_id,
-            raw_request=texte,
-            merged_request=merged,
-            resume_client=resume_out,
-            type_detecte=type_detecte,
-            zone_tarifaire=zone_tarifaire,
-            delai_estime=delai_estime,
-            prix_recommande_eur=prix,
-            conditions=conditions,
-            origin=origin,
-            destination=destination,
-            distance_km=distance_km,
-            toll_est_eur=toll_est_eur,
-            statut=statut,
-        )
+    statut = "en_attente_validation"
+    mission_id = create_mission(
+        ref=ref,
+        client_id=client_id,
+        message_id=message_id,
+        raw_request=texte,
+        merged_request=merged,
+        resume_client=resume_out,
+        type_detecte=type_detecte,
+        zone_tarifaire=zone_tarifaire,
+        delai_estime=delai_estime,
+        prix_recommande_eur=prix,
+        conditions=conditions,
+        origin=origin,
+        destination=destination,
+        distance_km=distance_km,
+        toll_est_eur=toll_est_eur,
+        statut=statut,
+    )
 
     _log("mission_processed", {
         "client_id": client_id,
