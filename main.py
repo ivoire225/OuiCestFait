@@ -10,6 +10,14 @@
 from __future__ import annotations
 
 import os
+
+# Charge automatiquement les variables d'environnement depuis un fichier .env (optionnel)
+# => permet de mettre AI_ENABLE / OPENAI_API_KEY / AI_MODEL sans setx.
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
 import re
 import json
 import time
