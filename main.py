@@ -1,4 +1,4 @@
-﻿# main.py — OuiCestFait (Option A — rapidité/volume/fiabilité)
+# main.py — OuiCestFait (Option A — rapidité/volume/fiabilité)
 # - Tarification IDF vs Hors IDF
 # - Hors IDF: distance auto (gratuit) + péage estimé (gratuit) => prix total sans demander le péage au client
 # - Anti-doublon (message_id + soft dedup), rate limiting, DB WAL/busy_timeout
@@ -6,8 +6,7 @@
 # - Base départ: Mormant 77720
 # - Urgent keywords => délai "sous 1h" sinon "dans la journée"
 #
-# Dépendances (requirements.txt): fastapi, uvicorn, pydantic, python-multipart (si form-data)
-
+# Dépendances (requirements.txt): fastapi, uvicorn, pydantic, python-multipart (si form-data) + openai (optionnel si IA)
 from __future__ import annotations
 
 import os
@@ -26,6 +25,12 @@ from typing import Optional, Dict, Any, List, Tuple, Union
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
+
+# OpenAI (optionnel) pour l'extraction IA
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:
+    OpenAI = None  # type: ignore
 
 # Compat Pydantic v1/v2
 try:
@@ -53,6 +58,16 @@ WHATSAPP_OWN_NUMBER = os.getenv("WHATSAPP_OWN_NUMBER", "").strip()
 # Debug (logs DB)
 DEBUG = os.getenv("DEBUG", "0") == "1"
 DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "").strip()  # protège endpoints debug/admin si souhaité
+
+# IA (optionnelle) — extraction structurée (adresses, type, urgence) via LLM
+AI_ENABLE = os.getenv("AI_ENABLE", "0").strip() in ("1", "true", "True", "yes", "YES")
+AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini").strip()
+AI_TIMEOUT_SEC = float(os.getenv("AI_TIMEOUT_SEC", "12"))
+AI_MAX_TEXT_CHARS = int(os.getenv("AI_MAX_TEXT_CHARS", "1400"))
+AI_MIN_CONFIDENCE = float(os.getenv("AI_MIN_CONFIDENCE", "0.72"))
+AI_FORCE_JSON = os.getenv("AI_FORCE_JSON", "1").strip() not in ("0", "false", "False", "no", "NO")
+AI_ONLY_WHEN_AMBIGUOUS = os.getenv("AI_ONLY_WHEN_AMBIGUOUS", "1").strip() not in ("0", "false", "False", "no", "NO")
+AI_CACHE_TTL_SEC = int(os.getenv("AI_CACHE_TTL_SEC", "86400"))  # 24h (0 = désactivé)
 
 # Déduplication
 DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "3600"))
@@ -139,7 +154,7 @@ CURRENCY_ROUND = Decimal("0.01")
 # App
 # =========================
 
-app = FastAPI(title=f"{APP_NAME} API", version="2.3.1")
+app = FastAPI(title=f"{APP_NAME} API", version="2.4.1")
 
 
 # =========================
@@ -275,6 +290,16 @@ def init_db() -> None:
         updated_at INTEGER NOT NULL
     )
     """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ai_cache (
+        k TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_cache_created ON ai_cache(created_at)")
+
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS geo_cache (
@@ -510,6 +535,175 @@ def resolve_payload(payload: DemandeMission) -> Tuple[str, Optional[str], str, D
     return cid, msg_id, txt, diag
 
 
+
+# =========================
+# IA — Extraction structurée (optionnelle)
+# =========================
+
+class AIExtract(BaseModel):
+    origin: Optional[str] = None
+    destination: Optional[str] = None
+    urgent: Optional[bool] = None
+    mission_type: Optional[str] = Field(None, description="livraison|courses|transport|conciergerie")
+    confidence: Optional[float] = Field(None, description="0..1")
+    missing_fields: Optional[List[str]] = None
+    notes: Optional[str] = None
+
+    if ConfigDict is not None:
+        model_config = ConfigDict(extra="ignore")
+    else:
+        class Config:
+            extra = "ignore"
+
+
+_ai_client: Optional[Any] = None
+
+
+def _get_ai_client() -> Optional[Any]:
+    global _ai_client
+    if _ai_client is not None:
+        return _ai_client
+    if OpenAI is None:
+        return None
+    try:
+        _ai_client = OpenAI()  # OPENAI_API_KEY lu depuis l'env
+        return _ai_client
+    except Exception:
+        return None
+
+
+def _strip_json(text_resp: str) -> str:
+    """Nettoie une réponse qui contient éventuellement des ```json ...```."""
+    s = (text_resp or "").strip()
+    # enlever fences
+    s = re.sub(r"^\s*```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*```\s*$", "", s)
+    # si texte autour, extraire premier objet JSON
+    if "{" in s and "}" in s:
+        start = s.find("{")
+        end = s.rfind("}")
+        if 0 <= start < end:
+            s = s[start:end+1]
+    return s.strip()
+
+
+def ai_extract_fields(text_in: str) -> Optional[AIExtract]:
+    """Appel IA synchrone (exécuté dans un thread côté endpoint).
+
+    Objectif:
+    - Extraire origin/destination quand le message est ambigu (ex: 'Adresse1 et Adresse2')
+    - Renforcer le type de mission
+    - Donner un score de confiance
+    """
+    if not AI_ENABLE:
+        return None
+
+    client = _get_ai_client()
+    if client is None:
+        return None
+
+    user_text = (text_in or "").strip()
+    if not user_text:
+        return None
+    if len(user_text) > AI_MAX_TEXT_CHARS:
+        user_text = user_text[:AI_MAX_TEXT_CHARS]
+
+    cached = ai_cache_get(user_text)
+    if cached is not None:
+        return cached
+
+    system = (
+        "Tu es un extracteur d'informations pour un service de livraison/conciergerie.\n"
+        "Ta tâche: convertir un message WhatsApp en données structurées.\n"
+        "Réponds UNIQUEMENT avec un JSON (pas de texte), avec ces clés:\n"
+        "{"
+        "\"origin\": string|null, "
+        "\"destination\": string|null, "
+        "\"urgent\": boolean|null, "
+        "\"mission_type\": \"livraison\"|\"courses\"|\"transport\"|\"conciergerie\"|null, "
+        "\"confidence\": number (0..1), "
+        "\"missing_fields\": array, "
+        "\"notes\": string|null"
+        "}\n"
+        "Règles:\n"
+        "- Si le message contient deux adresses séparées par 'et', la 1ère est origin, la 2ème destination.\n"
+        "- Essaie de garder les adresses telles quelles (rue, ville, CP).\n"
+        "- confidence haute (>=0.8) seulement si origin ET destination sont clairement identifiées.\n"
+        "- missing_fields doit inclure 'origin' et/ou 'destination' si incomplet.\n"
+    )
+
+    try:
+        # API OpenAI Python (v1+) — Chat Completions
+        kwargs = dict(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_text},
+            ],
+            temperature=0,
+        )
+        if AI_FORCE_JSON:
+            kwargs["response_format"] = {"type": "json_object"}
+        # Certains clients acceptent timeout=...
+        try:
+            resp = client.chat.completions.create(**kwargs, timeout=AI_TIMEOUT_SEC)
+        except TypeError:
+            # Fallback: certains SDKs n'acceptent pas timeout/response_format
+            kwargs.pop("response_format", None)
+            try:
+                resp = client.chat.completions.create(**kwargs)
+            except Exception:
+                return None
+
+        content = None
+        try:
+            content = resp.choices[0].message.content
+        except Exception:
+            content = None
+        if not content:
+            return None
+
+        js = _strip_json(content)
+        data = json.loads(js)
+
+        # Validation Pydantic
+        try:
+            out = AIExtract.model_validate(data) if hasattr(AIExtract, "model_validate") else AIExtract(**data)
+        except Exception:
+            return None
+
+        # Normalisation légère
+        if out.origin:
+            out.origin = str(out.origin).strip()
+        if out.destination:
+            out.destination = str(out.destination).strip()
+        if out.mission_type:
+            out.mission_type = str(out.mission_type).strip().lower()
+        if out.confidence is not None:
+            try:
+                out.confidence = float(out.confidence)
+            except Exception:
+                out.confidence = None
+
+        ai_cache_set(user_text, out)
+        return out
+    except Exception:
+        return None
+
+
+def ai_should_apply(ai: Optional[AIExtract]) -> bool:
+    if not ai:
+        return False
+    if ai.confidence is None:
+        return False
+    if ai.confidence < AI_MIN_CONFIDENCE:
+        return False
+    # Applique seulement si au moins une adresse est fournie
+    if not (ai.origin or ai.destination):
+        return False
+    return True
+
+
 # =========================
 # Détection (urgent / IDF / type)
 # =========================
@@ -533,16 +727,35 @@ def _contains_idf_postal_or_dept(text: str) -> bool:
     return False
 
 
-def is_idf_text(text: str) -> bool:
+def _extract_postal_depts(text: str) -> set[str]:
     t = (text or "").lower()
+    cps = re.findall(r"\b(\d{5})\b", t)
+    return {cp[:2] for cp in cps}
+
+
+def is_idf_text(text: str) -> bool:
+    """Heuristique IDF sur texte.
+
+    - Si on détecte des codes postaux (5 chiffres), on classe via le département (2 premiers chiffres).
+      * Si c'est "mixte" (IDF + non-IDF), on considère **non-IDF** (plus sûr).
+    - Sinon, on retombe sur les villes/keywords.
+    """
+    t = (text or "").lower()
+
+    depts = _extract_postal_depts(t)
+    if depts:
+        return depts.issubset(IDF_DEPTS)
+
     if _contains_idf_postal_or_dept(t):
         return True
+
     for c in IDF_CITIES:
         if c in t:
             return True
-    # mots-clés larges
+
     if any(k in t for k in ["idf", "ile de france", "île de france", "ile-de-france", "île-de-france"]):
         return True
+
     return False
 
 
@@ -561,39 +774,113 @@ def detect_type(text: str) -> str:
 # Extraction trajet (origin/destination)
 # =========================
 
-def extract_route(text: str) -> Tuple[str, str]:
-    """
-    Retourne (origin, destination).
-    Si ambigu: origin = BASE_LOCATION, destination = lieu trouvé ou texte.
-    """
-    s = (text or "").strip()
+_STREET_WORDS = (
+    "rue", "avenue", "av.", "boulevard", "bd", "chemin", "route", "impasse",
+    "allée", "allee", "place", "quai", "cours", "square", "résidence", "residence",
+)
 
-    # X -> Y
-    m = re.search(r"([A-Za-zÀ-ÿ0-9'\- ,]+)\s*(?:->|→)\s*([A-Za-zÀ-ÿ0-9'\- ,]+)", s)
+
+def _looks_like_address(part: str) -> bool:
+    t = (part or "").lower()
+    # Un numéro + un mot de voie => très probable adresse
+    has_number = bool(re.search(r"\b\d{1,4}\b", t))
+    has_street = any(w in t for w in _STREET_WORDS)
+    return has_number and has_street
+
+
+def _looks_like_place(part: str) -> bool:
+    """Heuristique souple: accepte une adresse OU un lieu plausible (ville/quartier + CP éventuel)."""
+    t = (part or "").strip().lower()
+    if not t:
+        return False
+    if _looks_like_address(t):
+        return True
+    # Code postal FR
+    if re.search(r"\b\d{5}\b", t):
+        return True
+    # Mention de département IDF
+    if re.search(r"\b(75|77|78|91|92|93|94|95)\b", t):
+        return True
+    # Présence d'une préposition typique (à/au/aux) + un nom
+    if re.search(r"\b(?:à|a|au|aux)\b", t):
+        return True
+    # Ville/quartier: 1..6 mots, lettres majoritaires
+    if re.fullmatch(r"[a-zà-ÿ'\- ]{3,}", t) and len(t.split()) <= 6:
+        return True
+    # Exemple: 'paris 15e'
+    if re.fullmatch(r"[a-zà-ÿ'\- ]{3,}\s*\d{1,2}e?", t):
+        return True
+    return False
+
+
+def is_route_ambiguous(full_text: str, origin: str, destination: str) -> bool:
+    """Décide si on doit tenter l'IA (coût) pour clarifier origin/destination."""
+    ft = (full_text or "").strip()
+    o = (origin or "").strip()
+    d = (destination or "").strip()
+    if not o or not d:
+        return True
+    if o == d:
+        return True
+    # Fallback typique: destination = texte complet
+    if d == ft or o == ft:
+        return True
+    if o == BASE_LOCATION and d == BASE_LOCATION:
+        return True
+    if len(o) > 160 or len(d) > 160:
+        return True
+    if not _looks_like_place(o) or not _looks_like_place(d):
+        return True
+    # Message avec 'et' mais extraction encore bancale
+    if re.search(r"\bet\b", ft, re.IGNORECASE) and (o == BASE_LOCATION or d == ft):
+        return True
+    return False
+
+
+def extract_route(text: str) -> Tuple[str, str]:
+    """Extrait (origin, destination) à partir du texte client.
+
+    Cas gérés :
+    - "X -> Y" / "X → Y"
+    - "de X à Y" / "depuis X vers Y"
+    - "récupérer à X ... livrer à Y"
+    - "ADRESSE1 et ADRESSE2" (ex: "15 rue ... à Paris ... et 3 rue ... à Orléans")
+    - fallback : origin = BASE_LOCATION, destination = texte
+    """
+    s = re.sub(r"\s+", " ", (text or "").strip())
+
+    # 1) Deux adresses séparées (et / , / ; / & / /) — seulement si ça ressemble à 2 adresses
+    m = re.split(r"\s*(?:\bet\b|&|/|,|;)\s*", s, maxsplit=1, flags=re.IGNORECASE)
+    if len(m) == 2:
+        p1, p2 = (m[0] or "").strip(), (m[1] or "").strip()
+        if _looks_like_address(p1) and _looks_like_address(p2):
+            return p1, p2
+
+    # 2) X -> Y
+    m = re.search(r"(.+?)\s*(?:->|→)\s*(.+)", s)
     if m:
         return m.group(1).strip(), m.group(2).strip()
 
-    # de X à Y
+    # 3) de X à Y
     m = re.search(r"(?:de|depuis)\s+(.+?)\s+(?:à|a|vers)\s+(.+)", s, re.IGNORECASE)
     if m:
         return m.group(1).strip(), m.group(2).strip()
 
-    # récupérer/enlever à X ... livrer à Y (robuste)
+    # 4) récupérer/enlever à X ... livrer à Y
     m = re.search(
-        r"(?:r[ée]cup[ée]rer|recuperer|prendre|collecter|enlever|enl[eè]ver|enl[eè]ve|enl[eè]vement|enlevement|ramasser|retirer).{0,120}?\b(?:à|au|aux)\s+(.+?)\b.{0,220}?\b(?:livrer|livraison|d[ée]poser|deposer|remettre).{0,120}?\b(?:à|au|aux)\s+(.+)",
+        r"(?:r[ée]cup[ée]rer|recuperer|prendre|collecter|enlever|enl[eè]ver|enl[eè]ve|enl[eè]vement|enlevement|ramasser|retirer).{0,120}?\b(?:à|au|aux)\s+(.+?)\b.{0,240}?\b(?:livrer|livraison|d[ée]poser|deposer|remettre).{0,120}?\b(?:à|au|aux)\s+(.+)",
         s,
         re.IGNORECASE,
     )
     if m:
         return m.group(1).strip(), m.group(2).strip()
 
-    # si "à Lyon" seulement -> dest = Lyon, origin = base
+    # 5) si "à Lyon" seulement -> dest = Lyon, origin = base
     m = re.search(r"(?:\bà\b|\ba\b)\s+([A-Za-zÀ-ÿ0-9'\- ,]{3,})", s, re.IGNORECASE)
     if m:
         dest = m.group(1).strip()
         return BASE_LOCATION, dest
 
-    # fallback: tout le texte comme "destination"
     return BASE_LOCATION, s or BASE_LOCATION
 
 
@@ -632,7 +919,6 @@ def dedup_check_and_store(message_id: Optional[str], client_id: str) -> bool:
         return False
     finally:
         conn.close()
-
 
 def soft_dedup_check_and_store(client_id: str, texte: str) -> bool:
     if SOFT_DEDUP_WINDOW_SEC <= 0:
@@ -716,6 +1002,7 @@ def buffer_append_and_maybe_flush(client_id: str, new_text: str) -> Tuple[bool, 
 
 
 # =========================
+# GEO# =========================
 # GEO (gratuit) + cache + throttle
 # =========================
 
@@ -829,6 +1116,33 @@ def geocode_address(addr: str) -> Optional[Tuple[float, float, str]]:
         return None
 
 
+def _dept_from_string(s: str) -> Optional[str]:
+    if not s:
+        return None
+    m = re.search(r"\b(\d{5})\b", s)
+    if not m:
+        return None
+    return m.group(1)[:2]
+
+
+def is_idf_place_geo(place: str) -> Optional[bool]:
+    """Détermine IDF via geocoding (si possible).
+
+    Retourne:
+    - True/False si un code postal est détecté (place ou display_name)
+    - None si on ne peut pas conclure
+    """
+    g = geocode_address(place)
+    if not g:
+        return None
+    _lat, _lon, disp = g
+    dept = _dept_from_string(disp) or _dept_from_string(place)
+    if not dept:
+        return None
+    return dept in IDF_DEPTS
+
+
+
 def osrm_route_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> Optional[Tuple[float, float]]:
     if not GEO_ENABLE:
         return None
@@ -893,8 +1207,6 @@ def compute_distance_km(origin: str, destination: str) -> Optional[float]:
     if km <= 0:
         return None
     return km
-
-
 def is_precise_place(s: str) -> bool:
     """Heuristique simple: une adresse avec CP/numéro est plus 'verrouillable' qu'un nom de ville seul."""
     if not s:
@@ -948,6 +1260,7 @@ def compute_trip_distance_km(origin: str, destination: str) -> Tuple[Optional[fl
 
     km_total = float(leg_to_pickup) + float(leg_delivery)
     return km_total, float(leg_to_pickup), float(leg_delivery)
+
 
 
 # =========================
@@ -1273,13 +1586,13 @@ async def mission_demande(request: Request) -> MissionOut:
     delai_estime = DELAI_URGENT if urgent else DELAI_STANDARD
     type_detecte = detect_type(merged)
 
+    # Extraction heuristique (fallback)
     origin, destination = extract_route(merged)
 
-    # Zone tarifaire: IDF uniquement si ORIGIN et DEST sont IDF
-    origin_idf = is_idf_text(origin)
-    dest_idf = is_idf_text(destination)
-    idf_internal = origin_idf and dest_idf
-
+    # Zone tarifaire (heuristique texte). Affinée plus bas si le géocodage est dispo.
+    origin_idf_txt = is_idf_text(origin)
+    dest_idf_txt = is_idf_text(destination)
+    idf_internal = bool(origin_idf_txt and dest_idf_txt)
     zone_tarifaire = "IDF" if idf_internal else "Hors IDF"
 
     # Si buffering activé et fenêtre non atteinte : on répond sans faire d'appels réseau (GEO/OSRM)
@@ -1310,7 +1623,48 @@ async def mission_demande(request: Request) -> MissionOut:
             ref_mission=None,
         )
 
-    # Distance (voiture) en intégrant le départ Mormant 77720
+
+        # IA (optionnelle): extraction des adresses/type quand le texte est ambigu
+        ai_info = None
+        if AI_ENABLE:
+            ai_needed = True
+            if AI_ONLY_WHEN_AMBIGUOUS:
+                ai_needed = is_route_ambiguous(merged, origin, destination)
+            if ai_needed:
+                try:
+                    ai_info = await asyncio.to_thread(ai_extract_fields, merged)
+                except Exception:
+                    ai_info = None
+
+        # Appliquer l'IA uniquement si la confiance est suffisante
+        if ai_should_apply(ai_info):
+            if ai_info.origin:
+                origin = ai_info.origin
+            if ai_info.destination:
+                destination = ai_info.destination
+            if ai_info.mission_type in ("livraison", "courses", "transport", "conciergerie"):
+                type_detecte = ai_info.mission_type
+
+            # IMPORTANT : l'urgence reste déterminée par les mots-clés (règle métier validée).
+            # On ne sur-écrit pas 'urgent' via l'IA pour éviter les faux positifs.
+
+            # Recalcule la zone tarifaire après ajustement IA (heuristique texte). Affinée GEO plus bas.
+            origin_idf_txt = is_idf_text(origin)
+            dest_idf_txt = is_idf_text(destination)
+            idf_internal = bool(origin_idf_txt and dest_idf_txt)
+            zone_tarifaire = "IDF" if idf_internal else "Hors IDF"
+
+            _log("ai_extract_applied", {
+                "client_id": client_id,
+                "message_id": message_id,
+                "confidence": getattr(ai_info, "confidence", None),
+                "origin": origin,
+                "destination": destination,
+                "mission_type": type_detecte,
+            })
+
+
+# Distance (voiture) en intégrant le départ Mormant 77720
     distance_km: Optional[float] = None
     km_base_to_pickup: Optional[float] = None
     km_pickup_to_drop: Optional[float] = None
@@ -1324,6 +1678,21 @@ async def mission_demande(request: Request) -> MissionOut:
             )
         except Exception:
             distance_km = None
+
+    # Raffinage IDF via géocodage (si un code postal est détectable).
+    # Important : évite les faux positifs quand le texte contient plusieurs villes (ex: Paris + Orléans).
+    if GEO_ENABLE:
+        try:
+            o_geo = await asyncio.to_thread(is_idf_place_geo, origin)
+            d_geo = await asyncio.to_thread(is_idf_place_geo, destination)
+
+            origin_idf = o_geo if o_geo is not None else origin_idf_txt
+            dest_idf = d_geo if d_geo is not None else dest_idf_txt
+
+            idf_internal = bool(origin_idf and dest_idf)
+            zone_tarifaire = "IDF" if idf_internal else "Hors IDF"
+        except Exception:
+            pass
 
     # Péage estimé (gratuit) — seulement hors IDF
     if (not idf_internal) and (distance_km is not None) and TOLL_EST_ENABLE:
@@ -1356,26 +1725,25 @@ async def mission_demande(request: Request) -> MissionOut:
                 + "L’adresse exacte peut ajuster légèrement."
             )
     ref = make_ref()
-
     statut = "en_attente_validation"
     mission_id = create_mission(
-        ref=ref,
-        client_id=client_id,
-        message_id=message_id,
-        raw_request=texte,
-        merged_request=merged,
-        resume_client=resume_out,
-        type_detecte=type_detecte,
-        zone_tarifaire=zone_tarifaire,
-        delai_estime=delai_estime,
-        prix_recommande_eur=prix,
-        conditions=conditions,
-        origin=origin,
-        destination=destination,
-        distance_km=distance_km,
-        toll_est_eur=toll_est_eur,
-        statut=statut,
-    )
+            ref=ref,
+            client_id=client_id,
+            message_id=message_id,
+            raw_request=texte,
+            merged_request=merged,
+            resume_client=resume_out,
+            type_detecte=type_detecte,
+            zone_tarifaire=zone_tarifaire,
+            delai_estime=delai_estime,
+            prix_recommande_eur=prix,
+            conditions=conditions,
+            origin=origin,
+            destination=destination,
+            distance_km=distance_km,
+            toll_est_eur=toll_est_eur,
+            statut=statut,
+        )
 
     _log("mission_processed", {
         "client_id": client_id,
