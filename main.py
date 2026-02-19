@@ -1632,47 +1632,47 @@ async def mission_demande(request: Request) -> MissionOut:
         )
 
 
-        # IA (optionnelle): extraction des adresses/type quand le texte est ambigu
-        ai_info = None
-        if AI_ENABLE:
-            ai_needed = True
-            if AI_ONLY_WHEN_AMBIGUOUS:
-                ai_needed = is_route_ambiguous(merged, origin, destination)
-            if ai_needed:
-                try:
-                    ai_info = await asyncio.to_thread(ai_extract_fields, merged)
-                except Exception:
-                    ai_info = None
+    # IA (optionnelle): extraction des adresses/type quand le texte est ambigu
+    ai_info = None
+    if AI_ENABLE:
+        ai_needed = True
+        if AI_ONLY_WHEN_AMBIGUOUS:
+            ai_needed = is_route_ambiguous(merged, origin, destination)
+        if ai_needed:
+            try:
+                ai_info = await asyncio.to_thread(ai_extract_fields, merged)
+            except Exception:
+                ai_info = None
 
-        # Appliquer l'IA uniquement si la confiance est suffisante
-        if ai_should_apply(ai_info):
-            if ai_info.origin:
-                origin = ai_info.origin
-            if ai_info.destination:
-                destination = ai_info.destination
-            if ai_info.mission_type in ("livraison", "courses", "transport", "conciergerie"):
-                type_detecte = ai_info.mission_type
+    # Appliquer l'IA uniquement si la confiance est suffisante
+    if ai_should_apply(ai_info):
+        if ai_info.origin:
+            origin = ai_info.origin
+        if ai_info.destination:
+            destination = ai_info.destination
+        if ai_info.mission_type in ("livraison", "courses", "transport", "conciergerie"):
+            type_detecte = ai_info.mission_type
 
-            # IMPORTANT : l'urgence reste déterminée par les mots-clés (règle métier validée).
-            # On ne sur-écrit pas 'urgent' via l'IA pour éviter les faux positifs.
+        # IMPORTANT : l'urgence reste déterminée par les mots-clés (règle métier validée).
+        # On ne sur-écrit pas 'urgent' via l'IA pour éviter les faux positifs.
 
-            # Recalcule la zone tarifaire après ajustement IA (heuristique texte). Affinée GEO plus bas.
-            origin_idf_txt = is_idf_text(origin)
-            dest_idf_txt = is_idf_text(destination)
-            idf_internal = bool(origin_idf_txt and dest_idf_txt)
-            zone_tarifaire = "IDF" if idf_internal else "Hors IDF"
+        # Recalcule la zone tarifaire après ajustement IA (heuristique texte). Affinée GEO plus bas.
+        origin_idf_txt = is_idf_text(origin)
+        dest_idf_txt = is_idf_text(destination)
+        idf_internal = bool(origin_idf_txt and dest_idf_txt)
+        zone_tarifaire = "IDF" if idf_internal else "Hors IDF"
 
-            _log("ai_extract_applied", {
-                "client_id": client_id,
-                "message_id": message_id,
-                "confidence": getattr(ai_info, "confidence", None),
-                "origin": origin,
-                "destination": destination,
-                "mission_type": type_detecte,
-            })
+        _log("ai_extract_applied", {
+            "client_id": client_id,
+            "message_id": message_id,
+            "confidence": getattr(ai_info, "confidence", None),
+            "origin": origin,
+            "destination": destination,
+            "mission_type": type_detecte,
+        })
 
 
-# Distance (voiture) en intégrant le départ Mormant 77720
+    # Distance (voiture) en intégrant le départ Mormant 77720
     distance_km: Optional[float] = None
     km_base_to_pickup: Optional[float] = None
     km_pickup_to_drop: Optional[float] = None
