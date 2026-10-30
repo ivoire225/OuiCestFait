@@ -3,6 +3,7 @@ name: OCF Safety CI
 on:
   push:
     branches:
+      - main
       - "maintenance/**"
   pull_request:
     branches:
@@ -10,6 +11,10 @@ on:
 
 permissions:
   contents: write
+
+concurrency:
+  group: ocf-safety-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   patch-and-test:
@@ -41,8 +46,18 @@ jobs:
       - name: Run safety tests
         run: python tests/test_main_safety.py -v
 
+      - name: Ensure main is already compliant
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          if ! git diff --quiet -- main.py; then
+            echo "main.py is not compliant with the deterministic safety patch"
+            git diff -- main.py
+            exit 1
+          fi
+
       - name: Commit generated patch to maintenance branch
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/maintenance/')
         shell: bash
         run: |
           if git diff --quiet -- main.py; then
