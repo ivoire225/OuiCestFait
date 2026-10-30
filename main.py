@@ -80,6 +80,7 @@ AI_CACHE_TTL_SEC = int(os.getenv("AI_CACHE_TTL_SEC", "86400"))  # 24h (0 = désa
 # Déduplication
 DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "3600"))
 SOFT_DEDUP_WINDOW_SEC = int(os.getenv("SOFT_DEDUP_WINDOW_SEC", "12"))
+ANTI_LOOP_WINDOW_SEC = int(os.getenv("ANTI_LOOP_WINDOW_SEC", "120"))
 
 # Rate limit (volume/fiabilité)
 RATE_LIMIT_CLIENT_PER_MIN = int(os.getenv("RATE_LIMIT_CLIENT_PER_MIN", "30"))
@@ -89,6 +90,7 @@ RATE_LIMIT_GLOBAL_PER_MIN = int(os.getenv("RATE_LIMIT_GLOBAL_PER_MIN", "800"))
 BASE_CITY = os.getenv("BASE_CITY", "Mormant")
 BASE_POSTAL = os.getenv("BASE_POSTAL", "77720")
 BASE_LOCATION = f"{BASE_CITY} {BASE_POSTAL}"
+SECONDARY_BASE_LOCATION = os.getenv("SECONDARY_BASE_LOCATION", "Paris 75000").strip()
 
 # Urgent (règle validée)
 URGENT_KEYWORDS = [
@@ -119,11 +121,11 @@ IDF_URGENT_MULT = Decimal(os.getenv("IDF_URGENT_MULT", "1.25"))
 MIN_PRICE_EUR = Decimal(os.getenv("MIN_PRICE_EUR", "25"))
 
 # Hors IDF (règle validée)
-# base = (1€ * km) + (2 * péage) + 30€ repas ; total = base * (1 + 40%)
+# base = (1€ * km) + (2 * péage) + 15€ repas ; total = base * (1 + 30%)
 PROV_EUR_PER_KM = Decimal(os.getenv("PROV_EUR_PER_KM", "1.0"))
 PROV_TOLL_MULT = Decimal(os.getenv("PROV_TOLL_MULT", "2.0"))
-PROV_MEAL_EUR = Decimal(os.getenv("PROV_MEAL_EUR", "30"))
-PROV_MARGIN_PCT = Decimal(os.getenv("PROV_MARGIN_PCT", "0.40"))  # +40%
+PROV_MEAL_EUR = Decimal(os.getenv("PROV_MEAL_EUR", "15"))
+PROV_MARGIN_PCT = Decimal(os.getenv("PROV_MARGIN_PCT", "0.30"))  # +30%
 PROV_URGENT_MULT = Decimal(os.getenv("PROV_URGENT_MULT", "1.15"))
 
 # Suppléments Province (optionnels) — validés
@@ -358,6 +360,40 @@ def _debug_allowed(token: str) -> bool:
     return token == DEBUG_TOKEN
 
 
+_SENSITIVE_LOG_KEYS = {
+    "authorization", "token", "api_key", "apikey", "secret", "password",
+    "stripe_signature", "stripe-signature", "x-ocf-token", "debug_token",
+    "openai_api_key", "webhook_secret",
+}
+
+
+def _mask_sensitive_string(value: str) -> str:
+    s = str(value)
+    s = re.sub(r"\bsk_(?:live|test)_[A-Za-z0-9_\-]+\b", "[REDACTED_STRIPE_KEY]", s)
+    s = re.sub(r"\bwhsec_[A-Za-z0-9_\-]+\b", "[REDACTED_WEBHOOK_SECRET]", s)
+    s = re.sub(
+        r"\b(cs_(?:live|test)_[A-Za-z0-9_\-]+)\b",
+        lambda m: m.group(1)[:12] + "..." + m.group(1)[-6:],
+        s,
+    )
+    s = re.sub(r"(?i)bearer\s+[A-Za-z0-9._~+\-/=]+", "Bearer [REDACTED]", s)
+    return s
+
+
+def _redact_for_log(value: Any, key: str = "") -> Any:
+    if key.lower() in _SENSITIVE_LOG_KEYS:
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {str(k): _redact_for_log(v, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_for_log(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_for_log(v) for v in value)
+    if isinstance(value, str):
+        return _mask_sensitive_string(value)
+    return value
+
+
 def _log(kind: str, payload: Dict[str, Any]) -> None:
     if not DEBUG:
         return
@@ -365,7 +401,7 @@ def _log(kind: str, payload: Dict[str, Any]) -> None:
         conn = _db()
         conn.execute(
             "INSERT INTO audit_log(kind, payload, created_at) VALUES(?,?,?)",
-            (kind, json.dumps(payload, ensure_ascii=False), utc_now_iso()),
+            (kind, json.dumps(_redact_for_log(payload), ensure_ascii=False), utc_now_iso()),
         )
         conn.commit()
         conn.close()
@@ -896,6 +932,11 @@ def extract_route(text: str) -> Tuple[str, str]:
 # Déduplication + buffer
 # =========================
 
+def _sha1(value: str) -> str:
+    """Stable SHA-1 fingerprint used only for anti-loop comparison, not for passwords."""
+    return hashlib.sha1((value or "").encode("utf-8", errors="ignore")).hexdigest()
+
+
 def anti_loop_ignore(client_id: str, incoming_text: str) -> bool:
     """Détecte un echo webhook: le message entrant est exactement notre dernière réponse.
 
@@ -1297,35 +1338,40 @@ def place_is_base(place: str) -> bool:
 
 
 def compute_trip_distance_km(origin: str, destination: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Distance totale en voiture en partant de la base (Mormant 77720).
+    """Distance totale de tarification avec double base validée.
 
-    Retourne (km_total, km_base_vers_origin, km_origin_vers_destination).
+    Pour chaque mission, on compare l'approche vers le point de prise en charge depuis :
+    - Mormant 77720 (BASE_LOCATION)
+    - Paris 75000 (SECONDARY_BASE_LOCATION)
 
-    - Si origin == base => km_total = base->destination
-    - Sinon => km_total = base->origin + origin->destination
+    On retient l'approche la plus longue, puis on ajoute origin -> destination.
+    Retourne (km_total, km_base_vers_origin_retenu, km_origin_vers_destination).
     """
     o = (origin or BASE_LOCATION).strip()
     d = (destination or BASE_LOCATION).strip()
 
-    # base -> destination (si origin non précisée ou égale à base)
-    if place_is_base(o):
-        leg_to_pickup = 0.0
-        leg_delivery = compute_distance_km(BASE_LOCATION, d)
-        if leg_delivery is None:
-            return None, None, None
-        return float(leg_delivery), float(leg_to_pickup), float(leg_delivery)
-
-    leg_to_pickup = compute_distance_km(BASE_LOCATION, o)
     leg_delivery = compute_distance_km(o, d)
+    if leg_delivery is None:
+        return None, None, None
 
-    if leg_to_pickup is None or leg_delivery is None:
-        # On renvoie ce qu'on a (utile debug/log), mais total reste None
-        return None, leg_to_pickup, leg_delivery
+    base_candidates: List[float] = []
+    for base in (BASE_LOCATION, SECONDARY_BASE_LOCATION):
+        base = (base or "").strip()
+        if not base:
+            continue
+        if _canon_addr(base) == _canon_addr(o):
+            base_candidates.append(0.0)
+            continue
+        leg = compute_distance_km(base, o)
+        if leg is not None:
+            base_candidates.append(float(leg))
 
+    if not base_candidates:
+        return None, None, float(leg_delivery)
+
+    leg_to_pickup = max(base_candidates)
     km_total = float(leg_to_pickup) + float(leg_delivery)
     return km_total, float(leg_to_pickup), float(leg_delivery)
-
-
 
 # =========================
 # Péage estimé (gratuit)
@@ -1862,7 +1908,7 @@ async def mission_demande(request: Request) -> MissionOut:
             ref_mission=ref if mission_id != 0 else None,
         )
 
-        anti_loop_store_last_response(client_id, resume_out)
+    anti_loop_store_last_response(client_id, resume_out)
 
     return MissionOut(
         mission_id=mission_id,
