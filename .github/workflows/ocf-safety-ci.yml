@@ -27,8 +27,10 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Apply deterministic safety patch
-        run: python scripts/apply_safe_patch.py
+      - name: Apply deterministic safety patches
+        run: |
+          python scripts/apply_safe_patch.py
+          python scripts/apply_antiloop_hash_patch.py
 
       - name: Compile main.py
         run: python -m py_compile main.py
